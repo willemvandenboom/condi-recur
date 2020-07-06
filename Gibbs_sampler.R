@@ -82,7 +82,6 @@ Gibbs_sampler <- function (
   
   # Variance parameters
   sigma2_Gibbs <- rep(NA_real_, n_recorded)
-  
   eta2_Gibbs <- rep(NA_real_, n_recorded)
   lambda_Gibbs <- rep(NA_real_, n_recorded)
   
@@ -725,7 +724,10 @@ Gibbs_sampler <- function (
           beta = beta,
           m_1 = m[index, 1],
           S = S[index],
-          LS = LS_compute(Sigma_Y_div_sigma2_compute(m_star_2, N[index]), sigma2),
+          LS = LS_compute(
+            Sigma_Y_div_sigma2 = Sigma_Y_div_sigma2_compute(m_star_2, N[index]),
+            sigma2 = sigma2
+          ),
           x = x[index, ]
         ),
         w = sqrt(Sigma_m_2)

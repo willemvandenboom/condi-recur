@@ -1,0 +1,358 @@
+---
+title: "Simulation"
+author: "Willem van den Boom"
+date: "June 21, 2020"
+output: html_document
+---
+
+
+## Generate data according to the model
+
+The following uses parallel computing which I have only tested on macOS and Linux and might therefore not work on Windows operating systems.
+
+```{r eval=FALSE}
+# For parallel computing
+if(!'doParallel' %in% rownames(installed.packages())) {
+  install.packages('doParallel', dependencies = T)
+}
+
+censoring_rate <- c(0, 0.5, 0.8, 0.9)
+n_cr <- length(censoring_rate)
+
+
+# Set seed for reproducibility.
+set.seed(1)
+
+L <- 150L # Number of individuals
+s <- rep(1:3, 50) # Cluster allocation
+K <- max(s) # Number of clusters
+
+# Specify the random effects.
+m <- matrix(data = NA_real_, nrow = L, ncol = 2)
+m[, 1] <- s
+for (h in 1:K) m[s == h, 2] <- (h - 2) * 0.8
+delta <- s + 4
+
+sigma2 <- 1
+eta2 <- 1
+lambda <- 7
+
+N <- as.integer(qpois(
+  p = runif(n = L, min = ppois(q = 0, lambda = lambda)),
+  lambda = lambda
+))
+N_max <- max(N)
+
+# The exponentiation can lead to `Inf`.
+# We therefore use `pmin`.
+S <- pmin(exp(rnorm(
+  n = L,
+  mean = delta,
+  sd = sqrt(eta2)
+)), 1e100)
+
+
+# Generate Y from its distribution conditional on S using rejection sampling.
+Y <- matrix(data = NA_real_, nrow = L, ncol = N_max)
+T_all <- Y
+for (i in 1:L) T_all[i, N[i]] <- Inf
+
+for (i in 1:L) while(T_all[i, N[i]] > S[i]) for (j in 1:N[i]) {
+  
+  Y[i, j] <- rnorm(
+    n = 1,
+    mean = m[i, 1] + if (j > 1) m[i, 2] * (Y[i, j - 1L] - m[i, 1]) else 0,
+    sd = sqrt(sigma2)
+  )
+  
+  T_all[i, j] <- exp(Y[i, j]) + if (j > 1) T_all[i, j - 1L] else 0
+  
+}
+
+
+# Generate data and run the Gibbs sampler for the r-th censoring rate.
+run_Gibbs <- function (r) {
+  
+  # Set seed for reproducibility.
+  set.seed(1)
+  
+  T_obs <- T_all
+  n <- N
+  c_i <- S
+  
+  cens <- rep(FALSE, L)
+  cens[sample(L, size = round(censoring_rate[r] * L))] <- TRUE
+  
+  for (i in which(cens)) {
+    c_i[i] <- runif(n = 1, min = T_all[i, 1], max = S[i])
+    tmp <- T_all[i, 1:N[i]] <= c_i[i]
+    T_obs[i, !tmp] <- NA_real_
+    n[i] <- sum(tmp)
+  }
+  
+  T_obs <- T_obs[, 1:max(n)]
+  
+  source("Gibbs_sampler.R")
+  
+  result <- Gibbs_sampler(
+    T_obs = T_obs,
+    n = n,
+    c_i = c_i,
+    cens = cens,
+    n_iter = 2e5L,
+    burnin = 2e4L,
+    thin = 1e1L
+  )
+  
+  return(list(result = result, n = n, cens = cens))
+  
+}
+
+
+# Setup for parallel computing
+# The `setup_strategy` argument is set as a workaround to a bug in RStudio
+# on macOS with R 4.0:
+# https://github.com/rstudio/rstudio/issues/6692#issuecomment-619645114
+cl <- parallel::makeCluster(n_cr, setup_strategy = "sequential")
+doParallel::registerDoParallel(cl)
+
+# Fit the Gibbs sampler for each of the simulated data sets.
+fit_list <- foreach::`%dopar%`(foreach::foreach(r = 1:n_cr), run_Gibbs(r))
+parallel::stopCluster(cl)
+
+result_c <- list()
+n_c <- list()
+cens_c <- list()
+
+for (r in 1:n_cr) {
+  result_c[[r]] <- fit_list[[r]]$result
+  n_c[[r]] <- fit_list[[r]]$n
+  cens_c[[r]] <- fit_list[[r]]$cens
+}
+
+rm(fit_list)
+```
+
+
+```{r include=FALSE, eval=FALSE}
+dir.create("Data", showWarnings = FALSE)
+save.image(file = "Data/simulation.RData", compress = TRUE)
+```
+
+```{r include=FALSE, eval=TRUE}
+load(file = "Data/simulation.RData")
+```
+
+
+
+
+
+## Number of events
+
+Compute and plot the CIs.
+
+```{r}
+titles <- paste0(100 * censoring_rate, "% censored")
+
+pdf(
+  file = paste0("Figures/N_CI_simulation.pdf"),
+  width = 10,
+  height = 15
+)
+
+par(mfrow = c(1, n_cr - 1), mar = c(4, 0, 3, 0))
+
+y <- rank(
+  x = 10000L * N + 100L * n_c[[4]] + colMeans(result_c[[4]]$N),
+  ties.method = "random"
+)
+
+for (r in 2:n_cr) {
+  
+  result <- result_c[[r]]
+  n <- n_c[[r]]
+  cens <- cens_c[[r]]
+
+  N_CI <- matrix(data = NA_real_, nrow = L, ncol = 3)
+  
+  N_CI[, 1] <- colMeans(result$N)
+  
+  for (i in 1:L) N_CI[i, 2:3] <- quantile(result$N[, i], prob = c(0.025, 0.975))
+  
+  # Plot an 'o' at the actual number of events.
+  plot(
+    x = N,
+    y = y,
+    pch = 1,
+    xlim = c(1, 17),
+    xlab = expression(italic("N"["i"])),
+    ylab = "",
+    yaxt = "n",
+    main = titles[r]
+  )
+   
+  for (i in which(cens)) {
+    
+    lines(x = N_CI[i,-1], y = rep(y[i], 2), lwd = 2)
+    
+    # Add an 'x' at the number of observed recurrent events.
+    points(x = n[i], y = y[i], pch = 4)
+    
+    # Add a solid dot at the posterior mean.
+    points(x = N_CI[i, 1], y = y[i], pch = 19)
+    
+  }
+
+}
+
+dev.off()
+```
+
+
+## Posterior predictive distributions of δ, mi0 and mi1
+
+```{r}
+pdf(file = "Figures/m_delta_new_simulation.pdf", width = 6.5, height = 9)
+par(mfrow = c(n_cr, 2))
+
+for (rr in 1:n_cr) {
+  
+  result <- result_c[[rr]]
+  
+  n_rep <- 3L
+  n_recorded <- length(result$M)
+  
+  m_new <- matrix(NA_real_, nrow = n_rep * n_recorded, ncol = 2)
+  delta_new <- rep(NA_real_, n_rep * n_recorded)
+  
+  sigma2_m <- 100
+  sigma2_delta <- 100
+  
+  set.seed(1)
+  
+  for (iter in 1:n_recorded) for (r in 1:n_rep) {
+    
+    ind <- n_rep * (iter - 1L) + r
+    
+    if (runif(1) < L / (result$M[iter] + L)) {
+      i <- sample.int(L, size = 1)
+      m_new[ind, ] <- result$m[iter, i, ]
+      delta_new[ind] <- result$delta[iter, i]
+    } else {
+      m_new[ind, ] <- rnorm(2, sd = sqrt(sigma2_m))
+      delta_new[ind] <- rnorm(1, sd = sqrt(sigma2_delta))
+    }
+    
+  }
+  
+  
+  delta_lim <- c(2.5, 14)
+  
+  plot_2D_density <- function(y, ylim, zlim, ylab) {
+    
+    tmp <- MASS::kde2d(
+      x = delta_new,
+      y = y,
+      h = 2 * c(MASS::bandwidth.nrd(delta_new), MASS::bandwidth.nrd(y)),
+      n = 200L,
+      lims = c(
+        delta_lim + c(-.05, .05) * diff(delta_lim),
+        ylim + c(-.05, .05) * diff(ylim)
+      )
+    )
+    
+    contour(
+      x = tmp$x,
+      y = tmp$y,
+      z = log(tmp$z),
+      xlim = delta_lim,
+      ylim = ylim,
+      zlim = zlim,
+      drawlabels = FALSE,
+      xlab = expression(delta[i]),
+      ylab = ylab,
+      main = titles[rr]
+    )
+    
+  }
+  
+  
+  plot_2D_density(
+    y = m_new[, 1],
+    ylim = c(-1, 5),
+    zlim = c(-6, -1),
+    ylab = expression('m'[i1])
+  )
+  
+  plot_2D_density(
+    y = m_new[, 2],
+    ylim = c(-2, 2.5),
+    zlim = c(-6, -1),
+    ylab = expression('m'[i2])
+  )
+  
+}
+
+dev.off()
+```
+
+
+## Marginal posterior densities for $\sigma^2$, $\eta^2$ and $\lambda$.
+
+```{r}
+pdf(file = "Figures/variances_lambda_simulation.pdf", width = 6.5, height = 9)
+
+par(mfrow = c(n_cr, 3))
+
+for (r in 1:n_cr) {
+  
+  plot(
+    x = density(result_c[[r]]$sigma2, from = 0.9, to = 1.4),
+    main = "",
+    xlab = expression(sigma^2),
+    lwd = 2
+  )
+  
+  plot(
+    x = density(result_c[[r]]$eta2, from = 0, to = 6),
+    main = titles[r],
+    xlab = expression(eta^2),
+    lwd = 2
+  )
+  
+  plot(
+    x = density(result_c[[r]]$lambda, from = 6.2, to = 9),
+    main = "",
+    xlab = expression(lambda),
+    lwd = 2
+  )
+  
+}
+
+dev.off()
+```
+
+
+## Marginal posterior of the number of clusters
+
+```{r}
+pdf(file = "Figures/n_cluster_simulation.pdf", width = 6.5, height = 3)
+
+par(mfrow = c(1, n_cr))
+
+for (r in 1:n_cr) {
+  
+  tmp <- table(factor(result_c[[r]]$K, levels = 3:7))
+  
+  barplot(
+    height = tmp / sum(tmp),
+    xlab = "Number of clusters",
+    ylab = "Posterior probability",
+    ylim = c(0, 1),
+    main = titles[r]
+  )
+
+}
+
+dev.off()
+```
