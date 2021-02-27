@@ -1,6 +1,6 @@
 # condi-recur
 
-Repository with the code used for the paper "Bayesian Joint Modelling of Recurrence and Survival: a Conditional Approach" by Willem van den Boom, Marta Tallarita and Maria De Iorio ([arXiv:2005.06819](https://arxiv.org/abs/2005.06819)).
+Repository with the code used for the paper "Bayesian inference on the number of recurrent events: A joint model of recurrence and survival" by Willem van den Boom, Maria De Iorio and Marta Tallarita ([arXiv:2005.06819](https://arxiv.org/abs/2005.06819)).
 
 
 ## Description of files

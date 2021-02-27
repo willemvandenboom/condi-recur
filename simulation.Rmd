@@ -1,7 +1,7 @@
 ---
 title: "Simulation"
 author: "Willem van den Boom"
-date: "June 21, 2020"
+date: "February 21, 2021"
 output: html_document
 ---
 
@@ -21,11 +21,17 @@ n_cr <- length(censoring_rate)
 
 
 # Set seed for reproducibility.
-set.seed(1)
+set.seed(20210221)
 
 L <- 150L # Number of individuals
 s <- rep(1:3, 50) # Cluster allocation
 K <- max(s) # Number of clusters
+
+# Generate the covariate values and their effects.
+q = 2
+x = matrix(data = runif(L * q), nrow = L, ncol = q)
+beta = c(-1, 1)
+gamma = c(-1, 1)
 
 # Specify the random effects.
 m <- matrix(data = NA_real_, nrow = L, ncol = 2)
@@ -41,13 +47,14 @@ N <- as.integer(qpois(
   p = runif(n = L, min = ppois(q = 0, lambda = lambda)),
   lambda = lambda
 ))
+
 N_max <- max(N)
 
 # The exponentiation can lead to `Inf`.
 # We therefore use `pmin`.
 S <- pmin(exp(rnorm(
   n = L,
-  mean = delta,
+  mean = x %*% gamma + delta,
   sd = sqrt(eta2)
 )), 1e100)
 
@@ -61,14 +68,13 @@ for (i in 1:L) while(T_all[i, N[i]] > S[i]) for (j in 1:N[i]) {
   
   Y[i, j] <- rnorm(
     n = 1,
-    mean = m[i, 1] + if (j > 1) m[i, 2] * (Y[i, j - 1L] - m[i, 1]) else 0,
+    mean = x[i, ] %*% beta + m[i, 1] + if (j > 1) m[i, 2] * (Y[i, j - 1L] - x[i, ] %*% beta - m[i, 1]) else 0,
     sd = sqrt(sigma2)
   )
   
   T_all[i, j] <- exp(Y[i, j]) + if (j > 1) T_all[i, j - 1L] else 0
   
 }
-
 
 # Generate data and run the Gibbs sampler for the r-th censoring rate.
 run_Gibbs <- function (r) {
@@ -99,6 +105,7 @@ run_Gibbs <- function (r) {
     n = n,
     c_i = c_i,
     cens = cens,
+    x = x,
     n_iter = 2e5L,
     burnin = 2e4L,
     thin = 1e1L
@@ -108,12 +115,7 @@ run_Gibbs <- function (r) {
   
 }
 
-
-# Setup for parallel computing
-# The `setup_strategy` argument is set as a workaround to a bug in RStudio
-# on macOS with R 4.0:
-# https://github.com/rstudio/rstudio/issues/6692#issuecomment-619645114
-cl <- parallel::makeCluster(n_cr, setup_strategy = "sequential")
+cl <- parallel::makeCluster(n_cr)
 doParallel::registerDoParallel(cl)
 
 # Fit the Gibbs sampler for each of the simulated data sets.
@@ -142,9 +144,6 @@ save.image(file = "Data/simulation.RData", compress = TRUE)
 ```{r include=FALSE, eval=TRUE}
 load(file = "Data/simulation.RData")
 ```
-
-
-
 
 
 ## Number of events
@@ -307,7 +306,7 @@ par(mfrow = c(n_cr, 3))
 for (r in 1:n_cr) {
   
   plot(
-    x = density(result_c[[r]]$sigma2, from = 0.9, to = 1.4),
+    x = density(result_c[[r]]$sigma2, from = 0.8, to = 1.3),
     main = "",
     xlab = expression(sigma^2),
     lwd = 2
@@ -321,7 +320,7 @@ for (r in 1:n_cr) {
   )
   
   plot(
-    x = density(result_c[[r]]$lambda, from = 6.2, to = 9),
+    x = density(result_c[[r]]$lambda, from = 5.5, to = 8),
     main = "",
     xlab = expression(lambda),
     lwd = 2
@@ -353,6 +352,114 @@ for (r in 1:n_cr) {
   )
 
 }
+
+dev.off()
+```
+
+
+## Credible intervals
+
+Compute and plot 95% posterior credible intervals for the regression coefficients 
+β (solid lines) and γ (dashed lines) of each covariate. 
+
+```{r}
+# Make the covariate names prettier for plotting.
+colnames(x) <- paste("Covariate", 1:2)
+
+r_width <- 0.9
+x_offset <- r_width / n_cr / 6
+
+dir.create("Figures", showWarnings = FALSE)
+pdf(file = "Figures/plot_CI_simulation.pdf", width = 6.5, height = 4)
+
+
+# Function that draws the credible interval
+plot_CI <- function(x, CI, lty = 1, col = "black") {
+  
+  # Draw the credible interval
+  lines(x = rep(x, 2), y = CI[-1], lty = lty, lwd = 2)
+  
+  # Add horizontal delimters to both end of the credible interval
+  for (y in CI[-1]) lines(
+    x = c(x - x_offset / 2, x + x_offset / 2),
+    y = rep(y, 2),
+    lwd = 2,
+    col = col
+  )
+  
+  # Add a dot at the posterior mean
+  points(x = x, y = CI[1], pch = 19, col = col)
+  
+}
+
+ylim = c(-7, 4.5)
+
+# Set margins to make room for x axis labels
+par(mar = c(2, 4, 3, 0) + 0.1)
+xlim = c(1 - r_width / 2, q + r_width / 2)
+
+# Set up empty plot
+plot(
+  x = 0,
+  type = 'n',
+  xlim = xlim,
+  ylim = ylim,
+  xlab = "",
+  ylab = "Regression coefficient",
+  xaxt = "n"
+)
+
+# Add x-axis tick mark text
+text(
+  x = 1:q,
+  y = ylim[1] - 1,
+  labels = colnames(x),
+  xpd = TRUE
+)
+
+abline(v = 0.5 + 1L:(q - 1L))
+
+# Add lines at the true values
+segments(x0 = xlim[1], y0 = -1, x1 = sum(xlim) / 2, col = "red")
+segments(x0 = sum(xlim) / 2, y0 = 1, x1 = xlim[2], col = "red")
+
+for (r in 1:n_cr) {
+  result <- result_c[[r]]
+  
+  beta_CI <- matrix(data = NA_real_, nrow = q, ncol = 3)
+  gamma_CI <- matrix(data = NA_real_, nrow = q, ncol = 3)
+  
+  beta_CI[, 1] <- colMeans(result$beta)
+  gamma_CI[, 1] <- colMeans(result$gamma)
+  
+  for (k in 1:q) {
+    beta_CI[k, 2:3] <- quantile(result$beta[, k], prob = c(0.025, 0.975))
+    gamma_CI[k, 2:3] <- quantile(result$gamma[, k], prob = c(0.025, 0.975))
+  }
+  
+  r_offset <- (r - 0.5 * n_cr - 0.5) * r_width / n_cr
+  
+  # Plot the q credible intervals
+  for (k in 1:q) {
+    plot_CI(x = k - x_offset + r_offset, CI = beta_CI[k, ])
+    plot_CI(x = k + x_offset + r_offset, CI = gamma_CI[k, ], lty = 2)
+    
+    text(
+      x = k + r_offset,
+      y = ylim[2] + 1,
+      labels = c("0%", "50%", "80%", "90%")[r],
+      xpd = TRUE
+    )
+  }
+  
+}
+
+for (k in 1:q) text(
+  x = k,
+  y = ylim[2] + 2,
+  labels = "Censoring rate",
+  xpd = TRUE
+)
 
 dev.off()
 ```

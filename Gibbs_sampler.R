@@ -22,6 +22,7 @@ Gibbs_sampler <- function (
   
   # Number of covariates
   q <- dim(x)[2]
+  if (q == 1) stop("This code does not work with only one covariate.")
   
   # The parameter "m" in Neal's Algorithm 8
   m_Neal8 <- 2L
