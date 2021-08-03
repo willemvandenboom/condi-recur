@@ -1,0 +1,844 @@
+---
+title: "Atrial fibrillation application"
+author: "Willem van den Boom"
+output: html_document
+---
+
+
+In addition to the following R packages, the usage of `rjags` in the comparison
+with [Paulon et al. (2018)] requires
+[JAGS](https://sourceforge.net/projects/mcmc-jags/) to be installed.
+
+[Paulon et al. (2018)]: https://doi.org/10.1093/biostatistics/kxy026
+
+```{r}
+for (tmp in c("frailtypack", "matrixStats", "openxlsx", "rjags")) {
+  
+  if(!tmp %in% rownames(installed.packages())) {
+    install.packages(tmp, dependencies = T)
+  }
+  
+}
+```
+
+
+## Read in the data and run the Gibbs sampler
+
+```{r eval=FALSE}
+AF_data <- openxlsx::read.xlsx(
+  xlsxFile = "https://doi.org/10.1371/journal.pone.0217983.s001"
+)
+
+
+# Recover the actual age from the demeaned version.
+AF_data$age <- AF_data$ageM + 64 - max(
+  AF_data$ageM[AF_data$ageter == "(54,64]"]
+)
+
+# Create binary indicators
+AF_data$gender <- AF_data$gender == "female"
+AF_data$AFtype <- AF_data$AFtype == "paroxysmal"
+AF_data$hypertension <- AF_data$hypertension == "yes"
+
+# Indicator for heart disease
+AF_data$heart_disease <- AF_data$heart.fail == "yes" |
+  AF_data$heart.valv.dis == "yes" | AF_data$isch.heart.dis == "yes"
+
+
+# Extract the recurrent events
+recurrent_events <- subset(
+  x = AF_data,
+  subset = !(AF_data$event.type %in% c("endpoint", "Death", "PermAF")),
+  select = c("Patient.ID", "end")
+)
+
+tmp <- table(recurrent_events$Patient.ID)
+IDs <- as.numeric(names(tmp))
+
+# Only consider patients with at least 1 recurrent event
+AF_data <- subset(AF_data, subset = AF_data$Patient.ID %in% IDs)
+L <- length(IDs)
+
+# Observed recurrent events
+T_obs <- matrix(NA_integer_, nrow = L, ncol = max(tmp) - 1)
+n <- rep(NA_integer_, L)
+
+# Survival and censoring times
+# The variable is called `c_i` instead of `c`
+# as the latter already has a different meaning in R.
+c_i <- aggregate(end ~ Patient.ID, data = AF_data, FUN = max)$end
+
+for (i in 1:L) {
+  tmp <- recurrent_events$end[recurrent_events$Patient.ID == IDs[i]]
+  n[i] <- length(tmp) - 1L
+  T_obs[i, seq_len(n[i])] <- tmp[-1] - tmp[1]
+  c_i[i] <- c_i[i] - tmp[1]
+}
+
+
+x <- AF_data[match(IDs, AF_data$Patient.ID), c(
+  "age",
+  "gender",
+  "AFtype",
+  "hypertension",
+  "heart_disease",
+  "Antiarrhythmic"
+)]
+
+x$age <- scale(x$age)
+x <- as.matrix(x)
+
+
+# Record whether someone is censored.
+cens <- aggregate(
+  formula = event.type ~ Patient.ID,
+  data = AF_data,
+  FUN = function(x) any(x == "endpoint")
+)$event.type
+
+
+# We no longer need `IDs`.
+rm(IDs, tmp, i)
+
+source("Gibbs_sampler.R")
+
+# Set seed for reproducibility.
+set.seed(1L)
+
+result <- Gibbs_sampler(
+  T_obs = T_obs,
+  n = n,
+  c_i = c_i,
+  cens = cens,
+  x = x,
+  n_iter = 2e5L,
+  burnin = 2e4L,
+  thin = 1e1L
+)
+```
+
+```{r include=FALSE, eval=FALSE}
+dir.create("Data", showWarnings = FALSE)
+save.image(file = "Data/AF_data.RData", compress = TRUE)
+```
+
+```{r include=FALSE, eval=TRUE}
+load(file = "Data/AF_data.RData")
+```
+
+
+## Credible intervals
+
+Compute and plot 95% posterior credible intervals for the regression
+coefficients β (solid lines) and γ (dashed lines) of each covariate. 
+
+```{r}
+# The number of covariates
+q <- ncol(x)
+
+beta_CI <- matrix(data = NA_real_, nrow = q, ncol = 3)
+gamma_CI <- matrix(data = NA_real_, nrow = q, ncol = 3)
+
+beta_CI[, 1] <- colMeans(result$beta)
+gamma_CI[, 1] <- colMeans(result$gamma)
+
+for (k in 1:q) {
+  beta_CI[k, 2:3] <- quantile(result$beta[, k], prob = c(0.025, 0.975))
+  gamma_CI[k, 2:3] <- quantile(result$gamma[, k], prob = c(0.025, 0.975))
+}
+
+
+# Make the covariate names prettier for plotting.
+colnames(x) <- c(
+  "Age",
+  "Female",
+  "Paroxysmal AF",
+  "Hypertension",
+  "Heart disease",
+  "Anti-arrhythmic med."
+)
+
+x_offset <- .15
+
+# Function that draws the credible interval
+plot_CI <- function(x, CI, lty = 1) {
+  
+  # Draw the credible interval
+  lines(x = rep(x, 2), y = CI[-1], lty = lty, lwd = 2)
+  
+  # Add horizontal delimters to both end of the credible interval
+  for (y in CI[-1]) lines(
+    x = c(x - x_offset / 2, x + x_offset / 2),
+    y = rep(y, 2),
+    lwd = 2
+  )
+  
+  # Add a dot at the posterior mean
+  points(x = x, y = CI[1], pch = 19)
+  
+}
+
+ylim = range(beta_CI, gamma_CI)
+
+
+dir.create("Figures", showWarnings = FALSE)
+pdf(file = "Figures/plot_CI_AF.pdf", width = 6.5, height = 4)
+
+# Set margins to make room for x axis labels
+par(mar = c(8.5, 4, 0, 0) + 0.1)
+
+# Set up empty plot
+plot(
+  x = 0,
+  type = 'n',
+  xlim = c(1 - 2 * x_offset, q + 2 * x_offset),
+  ylim = ylim,
+  xlab = "",
+  ylab = "Regression coefficient",
+  xaxt = "n"
+)
+
+# Add x-axis tick mark text
+text(
+  x = 1:q,
+  y = ylim[1] - 2,
+  srt = 90,
+  adj = 1,
+  labels = colnames(x),
+  xpd = TRUE
+)
+
+# Add a line at zero
+abline(h = 0)
+
+# Plot the q credible intervals
+for (k in 1:q) {
+  plot_CI(x = k - x_offset, CI = beta_CI[k, ])
+  plot_CI(x = k + x_offset, CI = gamma_CI[k, ], lty = 2)
+}
+
+dev.off()
+```
+
+
+## Number of events
+
+Compute and plot the CIs.
+
+```{r}
+N_CI <- matrix(data = NA_real_, nrow = L, ncol = 3)
+
+N_CI[, 1] <- colMeans(result$N)
+
+for (i in 1:L) N_CI[i, 2:3] <- quantile(result$N[, i], prob = c(0.025, 0.975))
+
+
+y <- rank(N_CI[,1], ties.method = "random")
+
+pdf(file = "Figures/N_CI_AF.pdf", width = 4, height = 7)
+par(mar = c(4, 0, 0, 0) + 0.1)
+
+plot(
+  x = N_CI[,1],
+  y = y,
+  pch = ifelse(cens, 19, 1),
+  xlim = range(N_CI),
+  xlab = expression(italic("N"["i"])),
+  ylab = "",
+  yaxt = "n"
+)
+
+for (i in which(cens)) {
+  
+  lines(x = N_CI[i,-1], y = rep(y[i], 2), lwd = 2)
+  
+  # Add an 'x' at the number of observed recurrent events.
+  points(x = n[i], y = y[i], pch = 4)
+  
+}
+
+dev.off()
+```
+
+
+## Posterior predictive distributions of δ, mi0 and mi1
+
+```{r}
+n_rep_pred <- 3L
+n_recorded <- length(result$M)
+
+m_new <- matrix(NA_real_, nrow = n_rep_pred * n_recorded, ncol = 2)
+delta_new <- rep(NA_real_, n_rep_pred * n_recorded)
+
+sigma2_m <- 100
+sigma2_delta <- 100
+
+set.seed(1L)
+
+for (iter in 1:n_recorded) for (r in 1:n_rep_pred) {
+  
+  ind <- n_rep_pred * (iter - 1L) + r
+  
+  if (runif(1) < L / (result$M[iter] + L)) {
+    i <- sample.int(L, size = 1)
+    m_new[ind, ] <- result$m[iter, i, ]
+    delta_new[ind] <- result$delta[iter, i]
+  } else {
+    m_new[ind, ] <- rnorm(2, sd = sqrt(sigma2_m))
+    delta_new[ind] <- rnorm(1, sd = sqrt(sigma2_delta))
+  }
+  
+}
+
+
+delta_lim <- c(-4, 13)
+
+plot_2D_density <- function(y, ylim, zlim, ylab) {
+  
+  tmp <- MASS::kde2d(
+    x = delta_new,
+    y = y,
+    h = 2 * c(MASS::bandwidth.nrd(delta_new), MASS::bandwidth.nrd(y)),
+    n = 200L,
+    lims = c(
+      delta_lim + c(-.05, .05) * diff(delta_lim),
+      ylim + c(-.05, .05) * diff(ylim)
+    )
+  )
+  
+  contour(
+    x = tmp$x,
+    y = tmp$y,
+    z = log(tmp$z),
+    xlim = delta_lim,
+    ylim = ylim,
+    zlim = zlim,
+    drawlabels = FALSE,
+    xlab = expression(delta[i]),
+    ylab = ylab,
+  )
+  
+}
+
+pdf(file = "Figures/m_delta_new_AF.pdf", width = 6.5, height = 3)
+par(mfrow = c(1, 2))
+
+plot_2D_density(
+  y = m_new[, 1],
+  ylim = c(4, 6),
+  zlim = c(-5, -1),
+  ylab = expression('m'[i1])
+)
+
+plot_2D_density(
+  y = m_new[, 2],
+  ylim = c(0, 0.5),
+  zlim = c(-4, 0),
+  ylab = expression('m'[i2])
+)
+
+dev.off()
+```
+
+
+## Cluster allocation that minimizes Binder's loss function
+
+```{r}
+# Split the Gibbs samples to estimate the transition probabilities
+# and minimize Binder's loss on different poterior samples.
+
+n_train <- n_recorded %/% 2L
+n_test <- n_recorded - n_train
+
+# Posterior incidence probabilities
+p_ij <- matrix(0L, nrow = L, ncol = L)
+
+for (iter in 2L * 1:n_train - 1L) {
+  p_ij <- p_ij + outer(result$s[iter, ], result$s[iter, ], "==")
+}
+
+p_ij <- p_ij / n_train
+
+Binder_g <- -Inf
+
+lower_tri_ind <- which(lower.tri(matrix(nrow = L, ncol = L)))
+
+for (iter in 2L * 1:n_test) {
+  
+  tmp <- sum(((p_ij - 0.5) * outer(
+    X = result$s[iter, ],
+    Y = result$s[iter, ],
+    FUN = "=="
+  ))[lower_tri_ind])
+  
+  if (tmp > Binder_g) {
+    Binder_g <- tmp
+    iter_min <- iter
+  }
+  
+}
+
+s_min <- result$s[iter_min, ]
+```
+
+
+## Sample-wide summary statistics
+
+```{r}
+print(table(n))
+
+Y_obs <- log(t(diff(t(cbind(0, T_obs)))))
+
+
+pdf(file = "Figures/hist_Y_ij_AF.pdf", width = 6.5, height = 3)
+hist(Y_obs, xlab = expression(Y[ij] ~ "(log days)"), main = "")
+dev.off()
+
+pdf(file = "Figures/hist_c_i_AF.pdf", width = 6.5, height = 3)
+par(mfrow = c(1, 2))
+breaks = 2:8
+ylim = c(0, 45)
+
+hist(
+  x = log(c_i[!cens]),
+  xlab = expression(log(S[i]) ~ "(log days)"),
+  main = "Uncensored",
+  breaks = breaks,
+  ylim = ylim
+)
+
+hist(
+  x = log(c_i[cens]),
+  xlab = expression(log(c[i]) ~ "(log days)"),
+  main = "Censored",
+  breaks = breaks,
+  ylim = ylim
+)
+
+dev.off()
+
+
+print(table(s_min))
+
+for (cl in c(0)) {
+  
+  cat(paste("\nCluster", cl, "\n"))
+  
+  ind <- if (cl == 0) rep(TRUE, L) else s_min == cl
+  print(paste("Number of patients:", sum(ind)))
+  print(paste("Proportion censored:", mean(cens[ind])))
+  
+  tmp <- n[ind & !cens]
+  print(paste("Average uncensored N_i:", mean(tmp)))
+  print(sd(tmp))
+  
+  tmp <- colMeans(result$N[, ind])
+  print(paste("Average posterior mean of N_i:", mean(tmp)))
+  print(sd(tmp))
+  
+  tmp <- Y_obs[ind, ]
+  print(paste("Average uncensored Y_ij:", mean(tmp, na.rm = TRUE)))
+  print(sd(tmp, na.rm = TRUE))
+  
+  tmp <- c(Y_obs[ind, ], colMeans(result$Y_unobs[, ind[cens], ], na.rm = TRUE))
+  print(paste("Average posteror mean of Y_ij:", mean(tmp, na.rm = TRUE)))
+  print(sd(tmp, na.rm = TRUE))
+  
+  tmp <- log(c_i[ind & !cens])
+  print(paste("Average uncensored log(S):", mean(tmp)))
+  print(sd(tmp))
+  
+  tmp <- colMeans(log(result$S[, ind]))
+  print(paste("Average posterior mean of log(S):", mean(tmp)))
+  print(sd(tmp))
+  
+  tmp <- AF_data$age[!duplicated(AF_data$Patient.ID)][ind]
+  print(paste("Average age:", mean(tmp)))
+  print(sd(tmp))
+  
+  for (var in colnames(x)[-1]) print(
+    paste0("Proportion ", var, ": ", mean(x[ind, var]))
+  )
+  
+}
+```
+
+
+## Marginal posterior density for $\sigma^2$ and the posterior predictives for $S_i$ and $N_i$
+
+```{r}
+x_mode <- rep(0, 6) # The modes of all covariates except age equal zero.
+x_mode[1] <- median(x[, 1])
+log_S_range <- c(0, 30)
+grid_size <- 200L
+
+log_S_grid <- seq(
+  from = log_S_range[1], to = log_S_range[2], length.out = grid_size
+)
+
+log_S_dens <- rep(0, grid_size)
+max_N <- 25L
+N_pmf <- rep(0, max_N + 1L)
+S_new <- rep(NA_real_, n_rep_pred * n_recorded)
+
+for (iter in 1:n_recorded) {
+  
+  N_pmf <- N_pmf + dnbinom(
+    x = 0:max_N, size = result$r[iter], mu = result$lambda[iter]
+  )
+  
+  for (r in 1:n_rep_pred) {
+    
+    ind <- n_rep_pred * (iter - 1L) + r
+    
+    # Generate S_i using rejection sampling.
+    T_N_i <- Inf
+    S_i <- 0
+  
+    while (T_N_i > S_i) {
+      
+      S_i <- min(exp(rnorm(
+        n = 1,
+        mean = sum(x_mode * result$gamma[iter, ]) + delta_new[ind],
+        sd = sqrt(result$eta2[iter])
+      )), 1e100)
+      
+      T_N_i <- 0
+      N_i <- rnbinom(n = 1, size = result$r[iter], mu = result$lambda[iter])
+      
+      for (j in seq_len(N_i)) {
+      
+        Y_i <- rnorm(
+          n = 1,
+          mean = sum(
+            x_mode * result$beta[iter, ]
+          ) + m_new[ind, 1] + if (j > 1) m_new[ind, 2] * (
+            Y_previous - sum(x_mode * result$beta[iter, ]) - m_new[ind, 1]
+          ) else 0,
+          sd = sqrt(result$sigma2[iter])
+        )
+        
+        Y_previous <- Y_i
+        T_N_i <- T_N_i + exp(Y_i)
+        
+      }
+    
+    }
+    
+    S_new[ind] <- S_i
+  
+  }
+  
+}
+
+
+pdf(file = "Figures/variance_S_N_AF.pdf", width = 6.5, height = 3)
+par(mfrow = c(1, 3))
+
+plot(
+  x = density(result$sigma2, to = 8),
+  main = "",
+  xlab = expression(sigma^2),
+  ylab = "Posterior density",
+  lwd = 2
+)
+
+plot(
+  x = density(log(S_new), from = 0, to = 25),
+  main = "",
+  xlab = expression(log(S[i])),
+  ylab = "Posterior predictive density",
+  lwd = 2
+)
+
+barplot(
+  height = N_pmf / n_recorded,
+  names.arg = 0:max_N,
+  main = "",
+  xlab = expression(N[i]),
+  ylab = "Posterior predictive probability"
+)
+
+dev.off()
+```
+
+
+## Marginal posterior of the number of clusters
+
+```{r}
+pdf(file = "Figures/n_cluster_AF.pdf", width = 6.5, height = 3)
+
+tmp <- table(result$K)
+
+barplot(
+  height = tmp / sum(tmp),
+  xlab = "Number of clusters",
+  ylab = "Posterior probability",
+  ylim = c(0, 1)
+)
+
+dev.off()
+```
+
+
+## Comparison with the Cox proportional hazards model
+
+```{r}
+summary(survival::coxph(survival::Surv(
+  time = c_i,
+  event = !cens
+) ~ x + rowMeans(Y_obs, na.rm = TRUE)))
+```
+
+
+## Comparison with `frailtypack`
+
+The function `frailtyPenal` requires that we use `cluster` and `terminal` instead of `frailtypack::cluster` and `frailtypack::terminal` in its `formula` argument.
+
+```{r}
+cluster <- frailtypack::cluster
+terminal <- frailtypack::terminal
+```
+
+
+We do not include the covariate `hypertension` as otherwise the method fails to converge.
+
+```{r}
+frailtypack::frailtyPenal(
+  formula = survival::Surv(
+    time = end,
+    event = !(event.type %in% c("Death", "endpoint"))
+  ) ~ cluster(Patient.ID) + ageM + gender + AFtype + heart_disease +
+    Antiarrhythmic + terminal(as.numeric(
+      event.type %in% c("Death", "PermAF")
+    )),
+  formula.terminalEvent = ~ ageM + gender + AFtype + heart_disease +
+    Antiarrhythmic,
+  data = AF_data,
+  jointGeneral = TRUE,
+  n.knots = 20,
+  kappa = c(1e4, 1e4)
+)
+```
+
+
+## Comparison with the Bayesian model from [Paulon et al. (2018)]
+
+The BUGS code is based on the code in the supplementary data of
+[Paulon et al. (2018)].
+
+```{r eval=FALSE}
+T_n <- rep(0, L)
+for (i in 1:L) if (n[i] >= 1) T_n[i] <- T_obs[i, n[i]]
+
+jags_model <- rjags::jags.model(
+  file = textConnection("model{
+    
+    for (i in 1:L) {
+      
+      # Likelihood for the n_i observed gap times
+      mu[i] <- sum(x[i, ] * beta) + alpha[i]
+      
+      # For loop in JAGS has behavior different from R:
+      # https://sourceforge.net/p/mcmc-jags/discussion/610037/thread/9468471a
+      for (j in 1:n[i]) {
+        Y[i,j] ~ dnorm(mu[i], prec[i])
+      }
+      
+      # Survival component for the last (always censored) gap time
+      cens_y[i] ~ dinterval(y_last[i], censorLimit_y[i])
+      y_last[i] ~ dnorm(mu[i], prec[i])
+      
+      # Likelihood (censored or not) for the survival component of the model
+      cens_u[i] ~ dinterval(U[i], censorLimit_u[i])
+      lambda[i] <- sum(x[i, ] * gamma) + psi * alpha[i]
+      U[i] ~ dnorm(lambda[i], precU)
+      
+    }
+    
+    # Prior specification
+    for (k in 1:q) {
+      beta[k] ~ dnorm(0,1.0E-2)
+      gamma[k] ~ dnorm(0,1.0E-2)
+    }
+    
+    precU ~ dgamma(2.01,1.01)
+    psi ~ dnorm(0,1.0E-2)
+    M ~ dunif(0.3, 5.0)
+    
+    # Stick-breaking construction
+    p[1] <- v[1]
+    
+    for (h in 2:Napp) {
+      p[h] <- v[h] * (1 - v[h - 1]) * p[h - 1] / v[h - 1]
+    }
+    
+    p.sum <- sum(p[])
+    
+    # Sample from the DP prior for alpha and prec
+    for (h in 1:Napp) {
+      
+      theta_1[h] ~ dnorm(0,1.0E-2) # locations of alpha
+      theta_2[h] ~ dgamma(2.01,1.01) # locations of prec
+      v[h] ~ dbeta(1, M)
+      
+      # Scaling to ensure sum to 1
+      pp[h] <- p[h]/p.sum
+      
+    }
+    
+    for (i in 1:L) {
+      S[i] ~ dcat(pp[]) # latent variable: cluster indicator
+      alpha[i] <- theta_1[S[i]]
+      prec[i] <- theta_2[S[i]]
+    }
+    
+    # Predictive distributions
+    S_new ~ dcat(pp[])
+    alpha_new <- theta_1[S_new]
+    prec_new <- theta_2[S_new]
+  
+  }"),
+  data = list(
+    Y = Y_obs,
+    U = ifelse(cens, NA, log(c_i)),
+    x = x,
+    Napp = 40L,
+    n = n,
+    q = q,
+    L = L,
+    cens_u = cens,
+    censorLimit_u = log(c_i),
+    cens_y = rep(1L, L),
+    censorLimit_y = log(c_i - T_n)
+  ),
+  # Set seed for reproducibility.
+  inits = list(.RNG.name = "base::Wichmann-Hill", .RNG.seed = 1)
+)
+
+rjags:::update.jags(object = jags_model, n.iter = 1e4)
+
+result_Paulon <- rjags::jags.samples(
+  model = jags_model,
+  variable.names = c(
+    "beta",
+    "gamma",
+    "psi",
+    "precU",
+    "alpha",
+    "alpha_new",
+    "prec_new"
+  ),
+  n.iter = 6e4,
+  thin = 12
+)
+```
+
+```{r include=FALSE, eval=FALSE}
+save(result_Paulon, file = "Data/result_Paulon.RData", compress = TRUE)
+```
+
+```{r include=FALSE, eval=TRUE}
+load(file = "Data/result_Paulon.RData")
+```
+
+
+Plot the marginal posterior on the number of clusters.
+
+```{r}
+pdf(file = "Figures/n_cluster_Paulon_AF.pdf", width = 6.5, height = 3)
+
+tmp <- table(
+  apply(result_Paulon$alpha, MARGIN = 2, FUN = function (x) length(unique(x)))
+)
+
+barplot(
+  height = tmp / sum(tmp),
+  xlab = "Number of clusters",
+  ylab = "Posterior probability",
+  ylim = c(0, 1)
+)
+
+dev.off()
+```
+
+
+Plot the credible intervals for the regression coefficients.
+
+```{r}
+beta_CI_Paulon <- matrix(data = NA_real_, nrow = q, ncol = 3)
+gamma_CI_Paulon <- matrix(data = NA_real_, nrow = q, ncol = 3)
+
+beta_CI_Paulon[, 1] <- rowMeans(result_Paulon$beta)
+gamma_CI_Paulon[, 1] <- rowMeans(result_Paulon$gamma)
+
+for (k in 1:q) {
+  
+  beta_CI_Paulon[k, 2:3] <- quantile(
+    x = result_Paulon$beta[k, , 1],
+    prob = c(0.025, 0.975)
+  )
+  
+  gamma_CI_Paulon[k, 2:3] <- quantile(
+    x = result_Paulon$gamma[k, , 1],
+    prob = c(0.025, 0.975)
+  )
+  
+}
+
+
+ylim = range(beta_CI_Paulon, gamma_CI_Paulon)
+
+pdf(file = "Figures/plot_CI_Paulon_AF.pdf", width = 6.5, height = 4)
+
+# Set margins to make room for x axis labels.
+par(mar = c(8.5, 4, 0, 0) + 0.1)
+
+# Set up empty plot
+plot(
+  x = 0,
+  type = 'n',
+  xlim = c(1 - 2 * x_offset, q + 2 * x_offset),
+  ylim = ylim,
+  xlab = "",
+  ylab = "Regression coefficient",
+  xaxt = "n"
+)
+
+# Add x-axis tick mark text.
+text(
+  x = 1:q,
+  y = ylim[1] - .75,
+  srt = 90,
+  adj = 1,
+  labels = colnames(x),
+  xpd = TRUE
+)
+
+# Add a line at zero.
+abline(h = 0)
+
+# Plot the q credible intervals for both sets of regression coefficients.
+for (k in 1:q) {
+  plot_CI(x = k-x_offset, CI = beta_CI_Paulon[k, ])
+  plot_CI(x = k+x_offset, CI = gamma_CI_Paulon[k, ], lty = 2)
+}
+
+dev.off()
+```
+
+
+Plot the marginal posterior of $\psi$.
+
+```{r}
+pdf(file = "Figures/psi_Paulon_AF.pdf", width = 6.5, height = 3)
+
+plot(
+  x = density(result_Paulon$psi),
+  main = "",
+  xlab = expression(psi),
+  lwd = 2
+)
+
+dev.off()
+```

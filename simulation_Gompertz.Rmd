@@ -1,5 +1,5 @@
 ---
-title: "Simulation studies"
+title: "Simulation study with a misspecified model"
 author: "Willem van den Boom"
 output: html_document
 ---
@@ -16,18 +16,20 @@ if(!'doParallel' %in% rownames(installed.packages())) {
   install.packages('doParallel', dependencies = T)
 }
 
-# Set seed for reproducibility.
-set.seed(1L)
-
 censoring_rate <- c(0, 0.5, 0.8, 0.9)
 n_cr <- length(censoring_rate)
+
+
+# Set seed for reproducibility.
+set.seed(1L)
 
 L <- 150L # Number of individuals
 s <- rep(1:3, L %/% 3) # Cluster allocation
 K <- max(s) # Number of clusters
 
-# Set the regression coefficients.
+# Generate the covariate values and their effects.
 q = 2
+x = matrix(data = runif(L * q), nrow = L, ncol = q)
 beta = c(-1, 1)
 gamma = c(-1, 1)
 
@@ -42,63 +44,42 @@ eta2 <- 1
 r <- 1
 lambda <- 7
 
-# Generate replicated simulated data
-n_rep <- 2L#8L
-x_r <- list()
-N_r <- list()
-S_r <- list()
-T_all_r <- list()
+N <- rnbinom(n = L, size = r, mu = lambda)
+N_max <- max(N)
 
-for (rr in 1:n_rep) {
+# Function that samples from the Gompertz distribution with shape parameter
+# `eta` and scale parameter `b`.
+rgompertz <- function(n, eta, b) log1p(-log1p(-runif(n)) / eta) / b
+
+# We therefore use `pmin` to avoid overflow.
+S <- pmin(rgompertz(
+  n = L, eta = 0.01, b = exp(-as.vector(x %*% gamma + delta))
+), 1e100)
+
+# Generate Y and S using rejection sampling.
+Y <- matrix(data = NA_real_, nrow = L, ncol = N_max)
+T_all <- Y
+
+for (i in 1:L) if (N[i] > 0) {
+  T_all[i, N[i]] <- Inf
   
-  # Generate the covariate values
-  x <- matrix(data = runif(L * q), nrow = L, ncol = q)
-  N <- rnbinom(n = L, size = r, mu = lambda)
-  N_max <- max(N)
-  
-  # The exponentiation can lead to `Inf`.
-  # We therefore use `pmin`.
-  S <- pmin(exp(rnorm(
-    n = L,
-    mean = x %*% gamma + delta,
-    sd = sqrt(eta2)
-  )), 1e100)
-  
-  # Generate Y and S using rejection sampling.
-  Y <- matrix(data = NA_real_, nrow = L, ncol = N_max)
-  T_all <- Y
-  
-  for (i in 1:L) if (N[i] > 0) {
-      
-    T_all[i, N[i]] <- Inf
+  while(T_all[i, N[i]] > S[i]) for (j in 1:N[i]) {
     
-    while(T_all[i, N[i]] > S[i]) for (j in 1:N[i]) {
-      
-      Y[i, j] <- rnorm(
-        n = 1,
-        mean = x[i, ] %*% beta + m[i, 1] + if (j > 1) m[i, 2] * (
-          Y[i, j - 1L] - x[i, ] %*% beta - m[i, 1]
-        ) else 0,
-        sd = sqrt(sigma2)
-      )
-      
-      T_all[i, j] <- exp(Y[i, j]) + if (j > 1) T_all[i, j - 1L] else 0
-      
-      S[i] <- pmin(exp(rnorm(
-        n = 1,
-        mean = sum(x[i, ] * gamma) + delta[i],
-        sd = sqrt(eta2)
-      )), 1e100)
-      
-    }
+    Y[i, j] <- rnorm(
+      n = 1,
+      mean = x[i, ] %*% beta + m[i, 1] + if (j > 1) m[i, 2] * (
+        Y[i, j - 1L] - x[i, ] %*% beta - m[i, 1]
+      ) else 0,
+      sd = sqrt(sigma2)
+    )
+    
+    T_all[i, j] <- exp(Y[i, j]) + if (j > 1) T_all[i, j - 1L] else 0
+    
+    S[i] <- pmin(rgompertz(
+      n = 1, eta = 0.01, b = exp(-as.vector(sum(x[i, ] * gamma) + delta[i]))
+    ), 1e100)
     
   }
-  
-  x_r[[rr]] <- x
-  N_r[[rr]] <- N
-  S_r[[rr]] <- S
-  T_all_r[[rr]] <- T_all
-  
 }
 
 
@@ -107,15 +88,12 @@ cens_c <- list()
 c_i_c <- list()
 n_c <- list()
 T_obs_c <- list()
+n_rep <- 1L
 
 for (r in 1:(n_cr * n_rep)) {
   
-  rr <- (r - 1L) %/% n_cr + 1L
-  T_all <- T_all_r[[rr]]
   T_obs <- T_all
-  N <- N_r[[rr]]
   n <- N
-  S <- S_r[[rr]]
   c_i <- S
   
   cens <- rep(FALSE, L)
@@ -138,14 +116,12 @@ for (r in 1:(n_cr * n_rep)) {
 }
 
 
-mu_lambda_vec <- c(0.1, 10)
-n_par <- n_rep * n_cr + 2
+n_par <- n_rep * n_cr
 seed_seq <- sample.int(.Machine$integer.max, size = n_par)
 
 
 # Function used for parallelization
 # It runs the Gibbs sampler on the data while cycling through the censoring rates for ind ≤ n_rep * n_cr.
-# For ind = n_rep * n_cr + 1, n_rep * n_cr + 2, it considers the other prior specification in mu_lambda for the highest censoring rate.
 run_Gibbs <- function (ind) {
   
   # Set seed for reproducibility.
@@ -155,17 +131,12 @@ run_Gibbs <- function (ind) {
   r <- ind
   mu_lambda <- 1
   
-  if (ind > n_rep * n_cr) {
-    r <- n_cr
-    mu_lambda <- mu_lambda_vec[n_rep * n_cr - ind]
-  }
-  
   return(Gibbs_sampler(
     T_obs = T_obs_c[[r]],
     n = n_c[[r]],
     c_i = c_i_c[[r]],
     cens = cens_c[[r]],
-    x = x_r[[(r - 1L) %/% n_cr + 1L]],
+    x = x,
     n_iter = 2e5L,
     burnin = 2e4L,
     thin = 1e1L,
@@ -179,94 +150,16 @@ cl <- parallel::makeCluster(parallel::detectCores())
 doParallel::registerDoParallel(cl)
 result_c <- foreach::`%dopar%`(foreach::foreach(ind = 1:n_par), run_Gibbs(ind))
 parallel::stopCluster(cl)
-save.image(file = "Data/simulation.RData", compress = TRUE)
 ```
 
 
 ```{r include=FALSE, eval=FALSE}
 dir.create("Data", showWarnings = FALSE)
-save.image(file = "Data/simulation.RData", compress = TRUE)
+save.image(file = "Data/simulation_Gompertz.RData", compress = TRUE)
 ```
 
 ```{r include=FALSE, eval=TRUE}
-load(file = "Data/simulation.RData")
-```
-
-
-## Number of events for the prior sensitivity
-
-Compute and plot the CIs.
-
-```{r}
-x <- x_r[[1]]
-N <- N_r[[1]]
-S <- S_r[[1]]
-T_all <- T_all_r[[1]]
-
-titles <- paste0("Prior mean = ", c(0.1, 1, 10))
-n_mu_lambda <- length(mu_lambda_vec)
-
-y <- rank(
-  x = 10000L * N + 100L * n_c[[4]] + colMeans(result_c[[4]]$N),
-  ties.method = "random"
-)
-
-pdf(
-  file = paste0("Figures/N_CI_sensitivity_simulation.pdf"),
-  width = 10,
-  height = 15
-)
-
-par(mfrow = c(1, n_mu_lambda + 1), mar = c(4, 0, 3, 0))
-
-
-for (r in 1:(n_mu_lambda + 1)) {
-  
-  if (r == 1L) {
-    ind <- n_par - 1L
-  } else if (r == 2L) {
-    ind <- 4
-  } else {
-    ind <- n_par
-  }
-  
-  result <- result_c[[ind]]
-  n <- n_c[[4]]
-  cens <- cens_c[[4]]
-
-  N_CI <- matrix(data = NA_real_, nrow = L, ncol = 3)
-  
-  N_CI[, 1] <- colMeans(result$N)
-  
-  for (i in 1:L) N_CI[i, 2:3] <- quantile(result$N[, i], prob = c(0.025, 0.975))
-  
-  # Plot an 'o' at the actual number of events.
-  plot(
-    x = N,
-    y = y,
-    pch = 1,
-    xlim = c(0, 46),
-    xlab = expression(italic("N"["i"])),
-    ylab = "",
-    yaxt = "n",
-    main = titles[r]
-  )
-   
-  for (i in which(cens)) {
-    
-    lines(x = N_CI[i,-1], y = rep(y[i], 2), lwd = 2)
-    
-    # Add an 'x' at the number of observed recurrent events.
-    points(x = n[i], y = y[i], pch = 4)
-    
-    # Add a solid dot at the posterior mean.
-    points(x = N_CI[i, 1], y = y[i], pch = 19)
-    
-  }
-
-}
-
-dev.off()
+load(file = "Data/simulation_Gompertz.RData")
 ```
 
 
@@ -278,13 +171,17 @@ Compute and plot the CIs.
 ```{r}
 titles <- paste0(100 * censoring_rate, "% censored")
 
+y <- rank(
+  x = 10000L * N + 100L * n_c[[4]] + colMeans(result_c[[4]]$N),
+  ties.method = "random"
+)
+
 pdf(
-  file = paste0("Figures/N_CI_simulation.pdf"),
+  file = paste0("Figures/N_CI_simulation_Gompertz.pdf"),
   width = 10,
   height = 15
 )
 
-count <- 0L  # Count number of CIs that do not cover the truth.
 par(mfrow = c(1, n_cr - 1), mar = c(4, 0, 3, 0))
 
 
@@ -314,7 +211,7 @@ for (r in 2:n_cr) {
    
   for (i in which(cens)) {
     
-    lines(x = N_CI[i, -1], y = rep(y[i], 2), lwd = 2)
+    lines(x = N_CI[i,-1], y = rep(y[i], 2), lwd = 2)
     
     # Add an 'x' at the number of observed recurrent events.
     points(x = n[i], y = y[i], pch = 4)
@@ -322,21 +219,21 @@ for (r in 2:n_cr) {
     # Add a solid dot at the posterior mean.
     points(x = N_CI[i, 1], y = y[i], pch = 19)
     
-    count <- count + (N_CI[i, 2] > N[i] || N_CI[i, 3] < N[i])
-    
   }
 
 }
 
 dev.off()
-print(paste("Number of CIs that do not cover the truth:", count))
 ```
 
 
 ## Posterior predictive distributions of δ, mi0 and mi1
 
 ```{r}
-pdf(file = "Figures/m_delta_new_simulation.pdf", width = 6.5, height = 9)
+pdf(
+  file = "Figures/m_delta_new_simulation_Gompertz.pdf", width = 6.5, height = 9
+)
+
 par(mfrow = c(n_cr, 2))
 m_new_c <- list()
 delta_new_c <- list()
@@ -407,14 +304,14 @@ for (rr in 1:n_cr) {
   plot_2D_density(
     y = m_new[, 1],
     ylim = c(-1, 5),
-    zlim = c(-4, -1),
+    zlim = c(-5, 0),
     ylab = expression('m'[i1])
   )
   
   plot_2D_density(
     y = m_new[, 2],
     ylim = c(-2, 2),
-    zlim = c(-4, -1),
+    zlim = c(-4.5, 0),
     ylab = expression('m'[i2])
   )
   
@@ -431,7 +328,7 @@ x_mode <- rep(NA_real_, q)
 for (j in 1:q) x_mode[j] <- median(x[, j])
 S_new <- rep(NA_real_, n_rep_pred * n_recorded)
 
-pdf(file = "Figures/variances_S_N_simulation.pdf", width = 6.5, height = 9)
+pdf(file = "Figures/variances_S_N_simulation_Gompertz.pdf", width = 6.5, height = 9)
 
 par(mfrow = c(n_cr, 3))
 
@@ -520,16 +417,92 @@ dev.off()
 ```
 
 
+```{r}
+x_mode <- rep(NA_real_, q)
+for (j in 1:q) x_mode[j] <- median(x[, j])
+log_S_range <- c(5, 12)
+grid_size <- 200L
+
+log_S_grid <- seq(
+  from = log_S_range[1], to = log_S_range[2], length.out = grid_size
+)
+
+
+pdf(
+  file = "Figures/variances_S_N_simulation_Gompertz.pdf",
+  width = 6.5,
+  height = 9
+)
+
+par(mfrow = c(n_cr, 3))
+
+for (rr in 1:n_cr) {
+  
+  log_S_dens <- rep(0, grid_size)
+  max_N <- 30L
+  N_pmf <- rep(0, max_N + 1L)
+  result <- result_c[[rr]]
+  
+  for (iter in 1:n_recorded) {
+    
+    N_pmf <- N_pmf + dnbinom(
+      x = 0:max_N, size = result$r[iter], mu = result$lambda[iter]
+    )
+    
+    for (r in 1:n_rep_pred) {
+    
+      ind <- n_rep_pred * (iter - 1L) + r
+      
+      log_S_dens <- log_S_dens + dnorm(
+        x = log_S_grid,
+        mean = sum(x_mode * result$gamma[iter,]) + delta_new_c[[rr]][ind],
+        sd = sqrt(result$eta2[iter])
+      )
+    
+    }
+  }
+  
+  plot(
+    x = density(result$sigma2, from = 0.9, to = 1.4),
+    main = "",
+    xlab = expression(sigma^2),
+    lwd = 2
+  )
+  
+  plot(
+    x = log_S_grid,
+    y = log_S_dens / (n_rep_pred * n_recorded),
+    type = "l",
+    main = titles[rr],
+    xlab = expression(log(S[i])),
+    ylab = "Posterior predictive density",
+    lwd = 2
+  )
+  
+  barplot(
+    height = N_pmf / n_recorded,
+    names.arg = 0:max_N,
+    main = "",
+    xlab = expression(N[i]),
+    ylab = "Posterior predictive probability"
+  )
+  
+}
+
+dev.off()
+```
+
+
 ## Marginal posterior of the number of clusters
 
 ```{r}
-pdf(file = "Figures/n_cluster_simulation.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/n_cluster_simulation_Gompertz.pdf", width = 6.5, height = 3)
 
 par(mfrow = c(1, n_cr))
 
 for (r in 1:n_cr) {
   
-  tmp <- table(factor(result_c[[r]]$K, levels = 3:6))
+  tmp <- table(factor(result_c[[r]]$K, levels = 2:6))
   
   barplot(
     height = tmp / sum(tmp),
@@ -558,7 +531,7 @@ r_width <- 0.9
 x_offset <- r_width / n_cr / 6
 
 dir.create("Figures", showWarnings = FALSE)
-pdf(file = "Figures/plot_CI_simulation.pdf", width = 6.5, height = 4)
+pdf(file = "Figures/plot_CI_simulation_Gompertz.pdf", width = 6.5, height = 4)
 
 
 # Function that draws the credible interval
@@ -580,10 +553,7 @@ plot_CI <- function(x, CI, lty = 1, col = "black") {
   
 }
 
-ylim = c(-3, 8.5)
-
-# Set margins to make room for x axis labels
-par(mar = c(2, 4, 3, 0) + 0.1)
+ylim = c(-2.5, 2.5)
 xlim = c(1 - r_width / 2, q + r_width / 2)
 
 # Set up empty plot
@@ -634,7 +604,7 @@ for (r in 1:n_cr) {
     
     text(
       x = k + r_offset,
-      y = ylim[2] + 1,
+      y = ylim[2] + 0.5,
       labels = c("0%", "50%", "80%", "90%")[r],
       xpd = TRUE
     )
@@ -644,7 +614,7 @@ for (r in 1:n_cr) {
 
 for (k in 1:q) text(
   x = k,
-  y = ylim[2] + 2,
+  y = ylim[2] + 1,
   labels = "Censoring rate",
   xpd = TRUE
 )
@@ -652,39 +622,3 @@ for (k in 1:q) text(
 dev.off()
 ```
 
-
-## Estimate bias and mean-squared error of coefficient and $m$ estimates
-
-```{r}
-post_means <- array(NA_real_, dim = c(n_cr, n_rep, 2 * q + 3 * 3))
-
-for (rr in 1:n_cr) for (r in 1:n_rep) {
-  
-  ind <- n_cr * (r - 1L) + rr
-  result <- result_c[[ind]]
-  post_means[rr, r, 1:q] <- colMeans(result$beta) - beta
-  post_means[rr, r, q + 1:q] <- colMeans(result$gamma) - gamma
-  
-  for (j in 1:3) {
-    ind <- which(s == j)
-    post_means[rr, r, 2 * q + j] <- mean(result$m[, ind, 1]) - m[j, 1]
-    post_means[rr, r, 2 * q + 3 + j] <- mean(result$m[, ind, 2]) - m[j, 2]
-    post_means[rr, r, 2 * q + 2 * 3 + j] <- mean(result$delta[, ind]) - delta[j]
-  }
-
-}
-```
-
-
-```{r}
-for (cov in 1:(2 * q + 3 * 3)) {
-  print(paste("Parameter", cov))
-  
-  for (rr in 1:n_cr) {
-    print(titles[rr])
-    tmp <- post_means[rr, , cov]
-    print(paste("Bias:", mean(tmp)))
-    print(paste("RMSE:", sqrt(sum(tmp * tmp) / n_rep)))
-  }
-}
-```

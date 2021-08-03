@@ -1,12 +1,15 @@
 ---
-title: "Code for 'Bayesian Joint Modelling of Recurrence and Survival: a Conditional Approach'"
+title: "Colorectal cancer application"
 author: "Willem van den Boom"
-date: "May 14, 2020"
 output: html_document
 ---
 
 
-In addition to the following R packages, the usage of `rjags` in the comparison with [Paulon et al. (2018)](https://doi.org/10.1093/biostatistics/kxy026) requires [JAGS](https://sourceforge.net/projects/mcmc-jags/) to be installed.
+In addition to the following R packages, the usage of `rjags` in the comparison
+with [Paulon et al. (2018)] requires
+[JAGS](https://sourceforge.net/projects/mcmc-jags/) to be installed.
+
+[Paulon et al. (2018)]: https://doi.org/10.1093/biostatistics/kxy026
 
 ```{r}
 for (tmp in c("frailtypack", "matrixStats", "openxlsx", "rjags")) {
@@ -22,36 +25,16 @@ for (tmp in c("frailtypack", "matrixStats", "openxlsx", "rjags")) {
 ## Read in the data and run the Gibbs sampler
 
 ```{r eval=FALSE}
-AF_data <- openxlsx::read.xlsx("https://doi.org/10.1371/journal.pone.0217983.s001")
-
-
-# Recover the actual age from the demeaned version.
-AF_data$age <- AF_data$ageM + 64 - max(
-  AF_data$ageM[AF_data$ageter == "(54,64]"]
-)
-
-# Create binary indicators
-AF_data$gender <- AF_data$gender == "female"
-AF_data$AFtype <- AF_data$AFtype == "paroxysmal"
-AF_data$hypertension <- AF_data$hypertension == "yes"
-
-# Indicator for heart disease
-AF_data$heart_disease <- AF_data$heart.fail == "yes" |
-  AF_data$heart.valv.dis == "yes" | AF_data$isch.heart.dis == "yes"
-
+data(readmission, package = "frailtypack")
 
 # Extract the recurrent events
 recurrent_events <- subset(
-  x = AF_data,
-  subset = !(AF_data$event.type %in% c("endpoint", "Death")),
-  select = c(Patient.ID, end)
+  x = readmission,
+  select = c("id", "t.start")
 )
 
-# Only consider patients with at least 2 recurrent events
-tmp <- table(recurrent_events$Patient.ID)
-IDs <- as.numeric(names(tmp[tmp > 1]))
-AF_data <- subset(AF_data, subset = AF_data$Patient.ID %in% IDs)
-
+tmp <- table(recurrent_events$id)
+IDs <- as.numeric(names(tmp))
 L <- length(IDs)
 
 # Observed recurrent events
@@ -61,31 +44,28 @@ n <- rep(NA_integer_, L)
 # Survival and censoring times
 # The variable is called `c_i` instead of `c`
 # as the latter already has a different meaning in R.
-c_i <- aggregate(end ~ Patient.ID, data = AF_data, FUN = max)$end
+c_i <- readmission$t.stop[readmission$event == 0L]
 
 for (i in 1:L) {
-  tmp <- recurrent_events$end[recurrent_events$Patient.ID == IDs[i]]
+  tmp <- recurrent_events$t.start[recurrent_events$id == IDs[i]]
   n[i] <- length(tmp) - 1L
-  T_obs[i, 1:n[i]] <- tmp[-1] - tmp[1]
-  c_i[i] <- c_i[i] - tmp[1]
+  T_obs[i, seq_len(n[i])] <- tmp[-1]
 }
 
 
-x <- AF_data[match(IDs, AF_data$Patient.ID), c(
-  "age",
-  "gender",
-  "AFtype",
-  "hypertension",
-  "heart_disease",
-  "Antiarrhythmic"
-)]
-
-x$age <- scale(x$age)
-x <- as.matrix(x)
+x <- model.matrix(IDs ~ ., data = readmission[match(IDs, readmission$id), c(
+  "chemo",
+  "sex",
+  "dukes"
+)])[, -1]
 
 
 # Record whether someone is censored.
-cens <- aggregate(event.type ~ Patient.ID, data = AF_data, FUN = function(x) any(x == "endpoint"))$event.type
+cens <- aggregate(
+  formula = death ~ id,
+  data =  readmission,
+  FUN = function(x) all(x == 0)
+)$death
 
 
 # We no longer need `IDs`.
@@ -94,7 +74,7 @@ rm(IDs, tmp, i)
 source("Gibbs_sampler.R")
 
 # Set seed for reproducibility.
-set.seed(1)
+set.seed(1L)
 
 result <- Gibbs_sampler(
   T_obs = T_obs,
@@ -110,18 +90,18 @@ result <- Gibbs_sampler(
 
 ```{r include=FALSE, eval=FALSE}
 dir.create("Data", showWarnings = FALSE)
-save.image(file = "Data/AF_data.RData", compress = TRUE)
+save.image(file = "Data/readmission.RData", compress = TRUE)
 ```
 
 ```{r include=FALSE, eval=TRUE}
-load(file = "Data/AF_data.RData")
+load(file = "Data/readmission.RData")
 ```
 
 
 ## Credible intervals
 
-Compute and plot 95% posterior credible intervals for the regression coefficients 
-β (solid lines) and γ (dashed lines) of each covariate. 
+Compute and plot 95% posterior credible intervals for the regression
+coefficients β (solid lines) and γ (dashed lines) of each covariate. 
 
 ```{r}
 # The number of covariates
@@ -141,12 +121,10 @@ for (k in 1:q) {
 
 # Make the covariate names prettier for plotting.
 colnames(x) <- c(
-  "Age",
+  "Chemotherapy",
   "Female",
-  "Paroxysmal AF",
-  "Hypertension",
-  "Heart disease",
-  "Anti-arrhythmic med."
+  "Stage C",
+  "Stage D"
 )
 
 x_offset <- .15
@@ -173,7 +151,7 @@ ylim = range(beta_CI, gamma_CI)
 
 
 dir.create("Figures", showWarnings = FALSE)
-pdf(file = "Figures/plot_CI.pdf", width = 6.5, height = 4)
+pdf(file = "Figures/plot_CI_readmission.pdf", width = 6.5, height = 4)
 
 # Set margins to make room for x axis labels
 par(mar = c(8.5, 4, 0, 0) + 0.1)
@@ -222,33 +200,45 @@ N_CI <- matrix(data = NA_real_, nrow = L, ncol = 3)
 N_CI[, 1] <- colMeans(result$N)
 
 for (i in 1:L) N_CI[i, 2:3] <- quantile(result$N[, i], prob = c(0.025, 0.975))
+N_CI <- N_CI[cens, ]
 
+ord <- rank(N_CI[, 1], ties.method = "random")
+ord <- order(N_CI[, 1])
+N_CI <- N_CI[ord, ]
+n_order <- n[cens][ord]
 
-y <- rank(N_CI[,1], ties.method = "random")
+pdf(file = "Figures/N_CI_readmission.pdf", width = 6.5, height = 7)
+par(mfrow = c(1, 3), mar = c(4, 0, 0, 0))
 
-y_offset <- 0.35
+n_col <- ceiling(sum(cens) / 3)  # Number of CIs in one column
 
-pdf(file = "Figures/N_CI.pdf", width = 4, height = 7)
-par(mar = c(4, 0, 0, 0) + 0.1)
-
-plot(
-  x = N_CI[,1],
-  y = y,
-  pch = ifelse(cens, 19, 1),
-  xlim = range(N_CI),
-  xlab = expression(italic("N"["i"])),
-  ylab = "",
-  yaxt = "n"
-)
-
-for (i in which(cens)) {
+for (r in 1:3) {
   
-  lines(x = N_CI[i,-1], y = rep(y[i], 2), lwd = 2)
+  offset <- (r - 1L) * n_col
+  ind <- offset + 1:n_col
   
-  # Add an 'x' at the number of observed recurrent events.
-  points(x = n[i], y = y[i], pch = 4)
+  plot(
+    x = N_CI[ind, 1],
+    y = 1:n_col,
+    pch = 19,
+    xlim = range(N_CI),
+    xlab = expression(italic("N"["i"])),
+    ylab = "",
+    yaxt = "n"
+  )
   
+  for (i in ind) {
+    
+    lines(x = N_CI[i, -1], y = rep(i - offset, 2), lwd = 2)
+    
+    # Add an 'x' at the number of observed recurrent events.
+    points(x = n_order[i], y = i - offset, pch = 4)
+    
+  }
+
 }
+
+
 
 dev.off()
 ```
@@ -257,20 +247,20 @@ dev.off()
 ## Posterior predictive distributions of δ, mi0 and mi1
 
 ```{r}
-n_rep <- 3L
+n_rep_pred <- 3L
 n_recorded <- length(result$M)
 
-m_new <- matrix(NA_real_, nrow = n_rep * n_recorded, ncol = 2)
-delta_new <- rep(NA_real_, n_rep * n_recorded)
+m_new <- matrix(NA_real_, nrow = n_rep_pred * n_recorded, ncol = 2)
+delta_new <- rep(NA_real_, n_rep_pred * n_recorded)
 
 sigma2_m <- 100
 sigma2_delta <- 100
 
-set.seed(1)
+set.seed(1L)
 
-for (iter in 1:n_recorded) for (r in 1:n_rep) {
+for (iter in 1:n_recorded) for (r in 1:n_rep_pred) {
   
-  ind <- n_rep * (iter - 1L) + r
+  ind <- n_rep_pred * (iter - 1L) + r
   
   if (runif(1) < L / (result$M[iter] + L)) {
     i <- sample.int(L, size = 1)
@@ -284,7 +274,7 @@ for (iter in 1:n_recorded) for (r in 1:n_rep) {
 }
 
 
-delta_lim <- c(-50, 40)
+delta_lim <- c(6.8, 12)
 
 plot_2D_density <- function(y, ylim, zlim, ylab) {
   
@@ -313,20 +303,20 @@ plot_2D_density <- function(y, ylim, zlim, ylab) {
   
 }
 
-pdf(file = "Figures/m_delta_new.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/m_delta_new_readmission.pdf", width = 6.5, height = 3)
 par(mfrow = c(1, 2))
 
 plot_2D_density(
   y = m_new[, 1],
-  ylim = c(2, 9),
-  zlim = c(-8, -3),
+  ylim = c(3, 9),
+  zlim = c(-5, -2),
   ylab = expression('m'[i1])
 )
 
 plot_2D_density(
   y = m_new[, 2],
-  ylim = c(-1, 1.5),
-  zlim = c(-6, 0),
+  ylim = c(-0.22, 0.6),
+  zlim = c(-3.5, 0),
   ylab = expression('m'[i2])
 )
 
@@ -383,26 +373,26 @@ print(table(n))
 Y_obs <- log(t(diff(t(cbind(0, T_obs)))))
 
 
-pdf(file = "Figures/hist_Y_ij.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/hist_Y_ij_readmission.pdf", width = 6.5, height = 3)
 hist(Y_obs, xlab = expression(Y[ij] ~ "(log days)"), main = "")
 dev.off()
 
-pdf(file = "Figures/hist_c_i.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/hist_c_i_readmission.pdf", width = 6.5, height = 3)
 par(mfrow = c(1, 2))
-breaks = 2:8
-ylim = c(0, 35)
+breaks = seq.int(from = 0, to = max(c_i), length.out = 10)
+ylim = c(0, 75)
 
 hist(
-  x = log(c_i[!cens]),
-  xlab = expression(log(S[i]) ~ "(log days)"),
+  x = c_i[!cens],
+  xlab = expression(S[i] ~ "(days)"),
   main = "Uncensored",
   breaks = breaks,
   ylim = ylim
 )
 
 hist(
-  x = log(c_i[cens]),
-  xlab = expression(log(c[i]) ~ "(log days)"),
+  x = c_i[cens],
+  xlab = expression(c[i] ~ "(days)"),
   main = "Censored",
   breaks = breaks,
   ylim = ylim
@@ -445,11 +435,7 @@ for (cl in 0:2) {
   print(paste("Average posterior mean of log(S):", mean(tmp)))
   print(sd(tmp))
   
-  tmp <- AF_data$age[!duplicated(AF_data$Patient.ID)][ind]
-  print(paste("Average age:", mean(tmp)))
-  print(sd(tmp))
-  
-  for (var in colnames(x)[-1]) print(
+  for (var in colnames(x)) print(
     paste0("Proportion ", var, ": ", mean(x[ind, var]))
   )
   
@@ -459,7 +445,7 @@ for (cl in 0:2) {
 # Kaplan-Meier plots
 S_log_post_mean <- colMeans(log(result$S))
 
-pdf(file = "Figures/K-M_plots.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/K-M_plots_readmission.pdf", width = 6.5, height = 3)
 
 plot(
   x = 0,
@@ -489,32 +475,92 @@ dev.off()
 ```
 
 
-## Marginal posterior densities for $\sigma^2$, $\eta^2$ and $\lambda$.
+## Marginal posterior density for $\sigma^2$ and the posterior predictives for $S_i$ and $N_i$
 
 ```{r}
-pdf(file = "Figures/variances_lambda.pdf", width = 6.5, height = 3)
+x_mode <- rep(0, q) # The modes of the covariates.
+x_mode[1] <- 1
 
+max_N <- 17L
+N_pmf <- rep(0, max_N + 1L)
+S_new <- rep(NA_real_, n_rep_pred * n_recorded)
+
+for (iter in 1:n_recorded) {
+  
+  N_pmf <- N_pmf + dnbinom(
+    x = 0:max_N, size = result$r[iter], mu = result$lambda[iter]
+  )
+  
+  for (r in 1:n_rep_pred) {
+    
+    ind <- n_rep_pred * (iter - 1L) + r
+    
+    # Generate S_i using rejection sampling.
+    T_N_i <- Inf
+    S_i <- 0
+  
+    while (T_N_i > S_i) {
+      
+      S_i <- min(exp(rnorm(
+        n = 1,
+        mean = sum(x_mode * result$gamma[iter, ]) + delta_new[ind],
+        sd = sqrt(result$eta2[iter])
+      )), 1e100)
+      
+      T_N_i <- 0
+      N_i <- rnbinom(n = 1, size = result$r[iter], mu = result$lambda[iter])
+      
+      for (j in seq_len(N_i)) {
+      
+        Y_i <- rnorm(
+          n = 1,
+          mean = sum(
+            x_mode * result$beta[iter, ]
+          ) + m_new[ind, 1] + if (j > 1) m_new[ind, 2] * (
+            Y_previous - sum(x_mode * result$beta[iter, ]) - m_new[ind, 1]
+          ) else 0,
+          sd = sqrt(result$sigma2[iter])
+        )
+        
+        Y_previous <- Y_i
+        T_N_i <- T_N_i + exp(Y_i)
+        
+      }
+    
+    }
+    
+    S_new[ind] <- S_i
+  
+  }
+
+}
+
+
+pdf(file = "Figures/variance_S_N_readmission.pdf", width = 6.5, height = 3)
 par(mfrow = c(1, 3))
 
 plot(
-  x = density(result$sigma2, to = 15),
+  x = density(result$sigma2, to = 4),
   main = "",
   xlab = expression(sigma^2),
+  ylab = "Posterior density",
   lwd = 2
 )
 
 plot(
-  x = density(result$eta2, to = 1),
+  x = density(log(S_new), from = 2, to = 17),
   main = "",
-  xlab = expression(eta^2),
+  xlab = expression(log(S[i])),
+  ylab = "Posterior predictive density",
   lwd = 2
 )
 
-plot(
-  x = density(result$lambda),
+barplot(
+  height = N_pmf / n_recorded,
+  names.arg = 0:max_N,
   main = "",
-  xlab = expression(lambda),
-  lwd = 2
+  xlab = expression(N[i]),
+  ylab = "Posterior predictive probability"
 )
 
 dev.off()
@@ -524,20 +570,18 @@ dev.off()
 ## Marginal posterior of the number of clusters
 
 ```{r}
-pdf(file = "Figures/n_cluster.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/n_cluster_readmission.pdf", width = 6.5, height = 3)
 
 tmp <- table(result$K)
 
 barplot(
   height = tmp / sum(tmp),
   xlab = "Number of clusters",
-  ylab = "Posterior probability",
-  ylim = c(0, .4)
+  ylab = "Posterior probability"
 )
 
 dev.off()
 ```
-
 
 
 ## Comparison with the Cox proportional hazards model
@@ -552,45 +596,39 @@ summary(survival::coxph(survival::Surv(
 
 ## Comparison with `frailtypack`
 
-The function `frailtyPenal` requires that we use `cluster` and `terminal` instead of `frailtypack::cluster` and `frailtypack::terminal` in its `formula` argument.
+The function `frailtyPenal` requires that we use `cluster` and `terminal`
+instead of `frailtypack::cluster` and `frailtypack::terminal` in its `formula`
+argument.
 
 ```{r}
 cluster <- frailtypack::cluster
 terminal <- frailtypack::terminal
 ```
 
-
-We do not include the covariate `hypertension` as otherwise the method fails to converge.
-
 ```{r}
 frailtypack::frailtyPenal(
   formula = survival::Surv(
-    time = end,
-    event = !(event.type %in% c("Death", "endpoint"))
-  ) ~ cluster(Patient.ID) + ageM + gender + AFtype + heart_disease +
-    Antiarrhythmic + terminal(as.numeric(
-      event.type %in% c("Death", "PermAF")
-    )),
-  formula.terminalEvent = ~ ageM + gender + AFtype + heart_disease +
-    Antiarrhythmic,
-  data = AF_data,
+    time, event
+  ) ~ cluster(id) + chemo + sex + dukes + terminal(death),
+  formula.terminalEvent = ~ chemo + sex + dukes,
+  data = readmission,
   jointGeneral = TRUE,
-  n.knots = 20,
-  kappa = c(1e4, 1e4)
+  n.knots = 14,
+  kappa = c(9.55e+9, 1.41e+12)
+  # n.knots = 20,
+  # kappa = c(1e4, 1e4)
 )
 ```
 
 
-## Comparison with the Bayesian model from [Paulon et al. (2018)](https://doi.org/10.1093/biostatistics/kxy026)
+## Comparison with the Bayesian model from [Paulon et al. (2018)]
 
-The BUGS code is based on the code in the supplementary data of [Paulon et al. (2018)](https://doi.org/10.1093/biostatistics/kxy026).
+The BUGS code is based on the code in the supplementary data of
+[Paulon et al. (2018)].
 
 ```{r eval=FALSE}
-T_n <- rep(NA_real_, L)
-
-for (i in 1:L) {
-  T_n[i] <- T_obs[i, n[i]]
-}
+T_n <- rep(0, L)
+for (i in 1:L) if (n[i] >= 1) T_n[i] <- T_obs[i, n[i]]
 
 jags_model <- rjags::jags.model(
   file = textConnection("model{
@@ -600,6 +638,8 @@ jags_model <- rjags::jags.model(
       # Likelihood for the n_i observed gap times
       mu[i] <- sum(x[i, ] * beta) + alpha[i]
       
+      # For loop in JAGS has behavior different from R:
+      # https://sourceforge.net/p/mcmc-jags/discussion/610037/thread/9468471a
       for (j in 1:n[i]) {
         Y[i,j] ~ dnorm(mu[i], prec[i])
       }
@@ -694,18 +734,20 @@ result_Paulon <- rjags::jags.samples(
 ```
 
 ```{r include=FALSE, eval=FALSE}
-save(result_Paulon, file = "Data/result_Paulon.RData", compress = TRUE)
+save(
+  result_Paulon, file = "Data/result_Paulon_readmission.RData", compress = TRUE
+)
 ```
 
 ```{r include=FALSE, eval=TRUE}
-load(file = "Data/result_Paulon.RData")
+load(file = "Data/result_Paulon_readmission.RData")
 ```
 
 
 Plot the marginal posterior on the number of clusters.
 
 ```{r}
-pdf(file = "Figures/n_cluster_Paulon.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/n_cluster_Paulon_readmission.pdf", width = 6.5, height = 3)
 
 tmp <- table(
   apply(result_Paulon$alpha, MARGIN = 2, FUN = function (x) length(unique(x)))
@@ -714,8 +756,7 @@ tmp <- table(
 barplot(
   height = tmp / sum(tmp),
   xlab = "Number of clusters",
-  ylab = "Posterior probability",
-  ylim = c(0, .4)
+  ylab = "Posterior probability"
 )
 
 dev.off()
@@ -748,7 +789,7 @@ for (k in 1:q) {
 
 ylim = range(beta_CI_Paulon, gamma_CI_Paulon)
 
-pdf(file = "Figures/plot_CI_Paulon.pdf", width = 6.5, height = 4)
+pdf(file = "Figures/plot_CI_Paulon_readmission.pdf", width = 6.5, height = 4)
 
 # Set margins to make room for x axis labels.
 par(mar = c(8.5, 4, 0, 0) + 0.1)
@@ -790,7 +831,7 @@ dev.off()
 Plot the marginal posterior of $\psi$.
 
 ```{r}
-pdf(file = "Figures/psi_Paulon.pdf", width = 6.5, height = 3)
+pdf(file = "Figures/psi_Paulon_readmission.pdf", width = 6.5, height = 3)
 
 plot(
   x = density(result_Paulon$psi),

@@ -1,4 +1,4 @@
-Gibbs_sampler <- function (
+Gibbs_sampler <- function(
   T_obs, # Observed recurrent event times
   n, # Vector with the number of recurrent events of each individual
   c_i, # Minimum of survival and censoring time
@@ -6,7 +6,9 @@ Gibbs_sampler <- function (
   x = matrix(NA_real_, nrow = nrow(T_obs), ncol = 0), # Covariates
   n_iter = 1e2L, # Number of iterations of the Gibbs sampler
   burnin = as.integer(n_iter / 4), # Number of burnin iterations
-  thin = 1L # Thinning rate
+  thin = 1L, # Thinning rate
+  a_lambda = 1, # Prior parameters for `lambda`
+  b_lambda = 1
 ) {
   
   if (!is.matrix(x)) stop("This code requires x to be a matrix.")
@@ -22,7 +24,7 @@ Gibbs_sampler <- function (
   
   # Number of covariates
   q <- dim(x)[2]
-  if (q == 1) stop("This code does not work with only one covariate.")
+  if (q == 1) stop("This code does not work with exactly one covariate.")
   
   # The parameter "m" in Neal's Algorithm 8
   m_Neal8 <- 2L
@@ -39,17 +41,16 @@ Gibbs_sampler <- function (
   a_M <- 2
   b_M <- 1
   
+  a_r <- 1
+  b_r <- 1
+  
   nu_sigma2 <- 4.02
   sigma2_0 <- 2.02 / 4.02
   
   nu_eta2 <- 4.02
   eta2_0 <- 2.02 / 4.02
   
-  a_lambda <- 1
-  b_lambda <- 1
-  
   a_eta2 <- (nu_eta2 + L) / 2
-  b_lambda_star <- b_lambda + L
   
   
   ## Objects to store the Gibbs samples
@@ -84,6 +85,7 @@ Gibbs_sampler <- function (
   # Variance parameters
   sigma2_Gibbs <- rep(NA_real_, n_recorded)
   eta2_Gibbs <- rep(NA_real_, n_recorded)
+  r_Gibbs <- rep(NA_real_, n_recorded)
   lambda_Gibbs <- rep(NA_real_, n_recorded)
   
   
@@ -94,6 +96,12 @@ Gibbs_sampler <- function (
   # Set lambda to the average of the observed N,
   # or, if there aren't any, then the average of n.
   lambda <- mean(n[if (all(cens)) 1:L else !cens])
+  
+  # Compute the initial value for r to match the variance of the observations.
+  r <- max(
+    0.01,
+    lambda^2 / (var(n[if (sum(!cens) < 2) 1:L else !cens]) - lambda)
+  )
   
   S <- ifelse(
     test = cens,
@@ -129,13 +137,9 @@ Gibbs_sampler <- function (
   Y_unobs <- matrix(NA_real_, nrow = L, ncol = 0)
   Y <- Y_obs
   
-  T_n <- rep(NA_real_, L)
-  T_N <- rep(NA_real_, L)
-  
-  for (i in 1:L) {
-    T_n[i] <- T_obs[i, n[i]]
-    T_N[i] <- T_n[i] + sum(exp(Y_unobs[i, seq_len(N[i] - n[i])]))
-  }
+  T_n <- numeric(L)
+  for (i in 1:L) if (n[i] > 0L) T_n[i] <- T_obs[i, n[i]]
+  T_N <- T_n
   
   
   # Function that computes Sigma_Y divided by sigma2
@@ -171,20 +175,24 @@ Gibbs_sampler <- function (
   log_sum_exp <- matrixStats::logSumExp
   
   # Function that computes LS_1 and LS_2
-  LS_compute <- function (Sigma_Y_div_sigma2, sigma2) {
+  LS_compute <- function(Sigma_Y_div_sigma2, sigma2) {
     
     L <- length(Sigma_Y_div_sigma2)
     LS <- matrix(NA_real_, nrow = L, ncol = 2)
     
     for(i in 1:L) {
       
-      Sigma_Y_i <- Sigma_Y_div_sigma2[[i]] * sigma2
-      tmp <- diag(Sigma_Y_i) / 2
-      N_i <- length(tmp)
+      N_i <- nrow(Sigma_Y_div_sigma2[[i]])
       
-      LS[i, 1] <- log_sum_exp(tmp)
-      LS[i, 2] <- log_sum_exp(tmp + rep(tmp, rep.int(N_i, N_i)) + Sigma_Y_i)
-      
+      if (N_i > 0) {
+        
+        Sigma_Y_i <- Sigma_Y_div_sigma2[[i]] * sigma2
+        tmp <- diag(Sigma_Y_i) / 2
+        
+        LS[i, 1] <- log_sum_exp(tmp)
+        LS[i, 2] <- log_sum_exp(tmp + rep(tmp, rep.int(N_i, N_i)) + Sigma_Y_i)
+        
+      }
     }
     
     LS
@@ -195,23 +203,23 @@ Gibbs_sampler <- function (
   # The Fenton-Wilkinson approximation to the normalization constants
   # Result is on a log scale.
   # The result is summed over the individuals considered.
-  Pr_sum_log <- function(beta, m_1, S, LS, x) {
+  Pr_sum_log <- function(beta, gamma, m_1, delta, eta2, LS, x) {
     
     if (is.vector(LS)) LS <- t(as.matrix(LS))
     
-    sum(pnorm(
-      q = log(S),
-      mean = x %*% beta + m_1 + 2 * LS[, 1] - LS[, 2] / 2,
-      sd = sqrt(LS[, 2] - 2 * LS[, 1]),
+    sum(ifelse(test = is.na(LS[, 1]), yes = 0, no = pnorm(
+      q = 0,
+      mean = x %*% beta + m_1 + 2 * LS[, 1] - LS[, 2] / 2 - x %*% gamma - delta,
+      sd = sqrt(LS[, 2] - 2 * LS[, 1] + eta2),
       log.p = TRUE
-    ))
+    )))
     
   }
   
   
   # Function that samples from a left-truncated normal distribution
   # using the inverse transformation method.
-  rnorm_truncated <- function (
+  rnorm_truncated <- function(
     n, mean = 0,
     sd = 1,
     lower_bound = -Inf,
@@ -246,7 +254,7 @@ Gibbs_sampler <- function (
   # Function for univariate slice sampling
   # This is an edited version of Radford Neal's code avaialable at
   # (https://www.cs.toronto.edu/~radford/ftp/slice-R-prog)
-  slice_sampling <- function (x0, g, w = 1, lower = -Inf, upper = +Inf) {
+  slice_sampling <- function(x0, g, w = 1, lower = -Inf, upper = +Inf) {
     
     # UNIVARIATE SLICE SAMPLING WITH STEPPING OUT AND SHRINKAGE
     #
@@ -266,8 +274,19 @@ Gibbs_sampler <- function (
     #
     # The value of this function is the new point sampled.
     
+    return_x0 <- function() {
+      
+      warning(
+        "Likelihood return NaN while slice sampling. Returning starting point."
+      )
+      
+      return(x0)
+      
+    }
+    
     # Determine the slice level, in log terms.
     logy <- g(x0) - rexp(1)
+    if (is.na(logy)) return(return_x0())
     
     # Find the initial interval to sample from.
     u <- runif(1, 0, w)
@@ -280,13 +299,17 @@ Gibbs_sampler <- function (
     # Expand the interval until its ends are outside the slice.
     repeat {
       if (L <= lower) break
-      if (g(L) <= logy) break
+      g_L <- g(L)
+      if (is.na(g_L)) return(return_x0())
+      if (g_L <= logy) break
       L <- L - w
     }
     
     repeat {
       if (R >= upper) break
-      if (g(R) <= logy) break
+      g_R <- g(R)
+      if (is.na(g_R)) return(return_x0())
+      if (g_R <= logy) break
       R <- R + w
     }
     
@@ -297,7 +320,9 @@ Gibbs_sampler <- function (
     # Sample from the interval, shrinking it on each rejection.
     repeat {
       x1 <- runif(1, L, R)
-      if (g(x1) >= logy) return(x1)
+      g_x1 <- g(x1)
+      if (is.na(g_x1)) return(return_x0())
+      if (g_x1 >= logy) return(x1)
       if (x1 > x0) R <- x1 else L <- x1
     }
     
@@ -309,7 +334,7 @@ Gibbs_sampler <- function (
   ## Main loop with the Gibbs sampler iterations
   for (iter in 1:n_iter) {
     
-    # This follows the steps in Algorithm A1 of the Supporting Information.
+    # This follows the steps in Algorithm S1 of the supplemental material.
     
     
     # Step 1: Update beta and gamma.
@@ -320,16 +345,18 @@ Gibbs_sampler <- function (
       # We compute `Sigma_beta_star` divided by sigma2.
       Sigma_beta_star_inv <- sigma2 / sigma2_beta * diag(q)
       
-      for (i in 1:L) Sigma_beta_star_inv <- Sigma_beta_star_inv + (
-        1 + (N[i] - 1) * (1 - m[i, 2])^2
+      for (i in 1:L) Sigma_beta_star_inv <- Sigma_beta_star_inv + ifelse(
+        test = N[i] == 0L, yes = 0, no = 1 + (N[i] - 1) * (1 - m[i, 2])^2
       ) * tcrossprod(x[i, ])
       
       Sigma_beta_star <- solve(Sigma_beta_star_inv)
+      mu_beta_star <- numeric(q)
       
-      mu_beta_star <- Sigma_beta_star %*% colSums(x * rowSums(cbind(
-        Y[, 1] - m[, 1],
-        (1 - m[, 2]) * (Y[, -1] - m[, 1] - m[, 2] * (Y[, -N_max] - m[, 1]))
-      ), na.rm = TRUE))
+      if (N[i] > 0) mu_beta_star <- Sigma_beta_star %*% colSums(
+          x * rowSums(cbind(
+            Y[, 1] - m[, 1],
+            (1 - m[, 2]) * (Y[, -1] - m[, 1] - m[, 2] * (Y[, -N_max] - m[, 1]))
+        ), na.rm = TRUE))
       
       # We compute `Sigma_eta_star` divided by eta2.
       Sigma_gamma_star <- solve(eta2 / sigma2_gamma * diag(q) + crossprod(x))
@@ -353,7 +380,7 @@ Gibbs_sampler <- function (
       
       beta[k] <- slice_sampling(
         x0 = beta[k],
-        g = function (beta_k) {
+        g = function(beta_k) {
           
           beta[k] <- beta_k
           
@@ -362,7 +389,7 @@ Gibbs_sampler <- function (
             mean = mu_beta_k_star,
             sd = sqrt(Sigma_beta_k_star),
             log = TRUE
-          ) - Pr_sum_log(beta, m[, 1], S, LS, x)
+          ) - Pr_sum_log(beta, gamma, m[, 1], delta, eta2, LS, x)
           
         },
         w = sqrt(Sigma_beta_k_star)
@@ -381,7 +408,7 @@ Gibbs_sampler <- function (
       
       gamma[k] <- slice_sampling(
         x0 = gamma[k],
-        g = function (gamma_k) {
+        g = function(gamma_k) {
           
           gamma[k] <- gamma_k
           
@@ -390,10 +417,7 @@ Gibbs_sampler <- function (
             mean = mu_gamma_k_star,
             sd = sqrt(Sigma_gamma_k_star),
             log = TRUE
-          ) - sum(pnorm(
-            q = (x %*% gamma + delta - log(T_N)) / sqrt(eta2),
-            log.p = TRUE
-          ))
+          ) - Pr_sum_log(beta, gamma, m[, 1], delta, eta2, LS, x)
           
         },
         w = sqrt(Sigma_gamma_k_star)
@@ -408,10 +432,11 @@ Gibbs_sampler <- function (
       
       # Step 2(a): Update N_i using a reversible jump sampler
       
-      # Propose N_i from a Poisson distribution left-truncated at n_i.
-      N_proposal <- as.integer(qpois(
-        p = runif(n = 1, min = ppois(q = n[i] - 1, lambda = lambda)),
-        lambda = lambda
+      # Propose N_i from a negative binomial distribution left-truncated at n_i.
+      N_proposal <- as.integer(qnbinom(
+        p = runif(n = 1, min = pnbinom(q = n[i] - 1, size = r, mu = lambda)),
+        size = r,
+        mu = lambda
       ))
       
       N_d_proposal <- N_proposal - n[i]
@@ -430,10 +455,9 @@ Gibbs_sampler <- function (
       mu <- sum(x[i, ] * beta) + m[i, 1]
       
       # Compute the acceptance probability.
-      C_div_f_log <- function (Y_unobs_i) {
+      C_div_f_log <- function(Y_unobs_i) {
         
         if (any(is.infinite(Y_unobs_i))) return(-Inf)
-        
         N_d <- length(Y_unobs_i)
         
         LS_tmp <- LS_compute(
@@ -441,19 +465,30 @@ Gibbs_sampler <- function (
           sigma2
         )
         
-        Pr <- Pr_sum_log(beta, m[i, 1], S[i], LS_tmp, x[i, ])
+        Pr <- Pr_sum_log(beta, gamma, m[i, 1], delta[i], eta2, LS_tmp, x[i, ])
+        if (N_d == 0L) return(-Pr)
+        sigma <- sqrt(sigma2)
         
-        if (N_d == 0) return(-Pr)
-        
-        C_log <- sum(dnorm(
-          x = Y_unobs_i,
-          mean = mu + m[i, 2] * (c(
-            Y_obs[i, n[i]],
-            Y_unobs_i[-length(Y_unobs_i)]
-          ) - mu),
-          sd = sqrt(sigma2),
-          log = TRUE
-        )) - Pr
+        if (n[i] == 0L) {
+          C_log <- dnorm(
+            x = Y_unobs_i[1],
+            mean = mu,
+            sd = sigma,
+            log = TRUE
+          ) + sum(dnorm(
+            x = Y_unobs_i[-1],
+            mean = mu + m[i, 2] * (Y_unobs_i[-N_d] - mu),
+            sd = sigma,
+            log = TRUE
+          )) - Pr
+        } else {
+          C_log <- sum(dnorm(
+            x = Y_unobs_i,
+            mean = mu + m[i, 2] * (c(Y_obs[i, n[i]], Y_unobs_i[-N_d]) - mu),
+            sd = sigma,
+            log = TRUE
+          )) - Pr
+        }
         
         f_log <- log(
           exp(Y_unobs_i[1]) + T_n[i] - c_i[i]
@@ -471,10 +506,12 @@ Gibbs_sampler <- function (
       
       N_d <- N[i] - n[i]
       Y_unobs_i <- Y_unobs[i, seq_len(N_d)]
-      
       a <- exp(C_div_f_log(Y_unobs_i_proposal) - C_div_f_log(Y_unobs_i))
       
-      if (runif(1) < a) {
+      if (is.na(a)) {
+        warning("`a` evaluated as NA. Skipping this observation.")
+        next
+      } else if (runif(1) < a) {
         
         N[i] <- N_proposal
         N_d <- N_d_proposal
@@ -503,20 +540,22 @@ Gibbs_sampler <- function (
         first <- j == 1L
         last <- j == N_d
         
-        Y_previous <- ifelse(first, Y_obs[i, n[i]], Y_unobs_i[j - 1L])
+        Y_previous_mu <- ifelse(first, Y_obs[i, n[i]], Y_unobs_i[j - 1L]) - mu
         
         Y_unobs_i[j] <- rnorm_truncated(
           n = 1,
           mean = mu + ifelse(
             test = last,
-            yes = m[i, 2] * (Y_previous - mu),
-            no = m[i, 2] / (1 + m[i, 2]^2) * (
-              Y_previous + Y_unobs_i[j + 1L] - 2 * mu
-            )
+            yes = ifelse(N[i] == 1, 0, m[i, 2] * Y_previous_mu),
+            no = m[i, 2] / (1 + m[i, 2]^2) * (Y_unobs_i[j + 1L] - mu + ifelse(
+              test = first,
+              yes = 0,
+              no = Y_previous_mu
+            ))
           ),
           sd = sqrt(ifelse(last, sigma2, sigma2 / (1 + m[i, 2]^2))),
           lower_bound = ifelse(first, log(c_i[i] - T_n[i]), -Inf),
-          upper_bound = log(S[i] - T_n[i] - sum(Y_unobs_i[-j]))
+          upper_bound = log(S[i] - T_n[i] - sum(exp(Y_unobs_i[-j])))
         )
         
       }
@@ -573,7 +612,7 @@ Gibbs_sampler <- function (
       
       # Sample candidate parameter values for new clusters.
       m_proposal <- matrix(rnorm(
-        n = 2 * m_Neal8,
+        n = 2L * m_Neal8,
         sd = sqrt(sigma2_m)
       ), ncol = 2)
       
@@ -583,7 +622,7 @@ Gibbs_sampler <- function (
       s_i <- s[i]
       s_n[s_i] <- s_n[s_i] - 1L
       
-      if (s_n[s_i] == 0) {
+      if (s_n[s_i] == 0L) {
         
         K <- K - 1L # Number of clusters
         
@@ -594,8 +633,8 @@ Gibbs_sampler <- function (
         m_proposal[1, ] <- m[i, ]
         delta_proposal[1] <- delta[i]
         
-        # Ensure that `index` defined next identifies
-        # the parameters of cluster s_i correctly.
+        # Ensure that `index` defined next identifies the parameters of cluster
+        # s_i correctly.
         s[i] <- NA
         
       }
@@ -603,7 +642,7 @@ Gibbs_sampler <- function (
       # Keep track of m_i_2 to see whether we need to recompute LS.
       m_i_2 <- m[i, 2]
       
-      Z_i <- Z[i, 1:N[i]]
+      Z_i <- Z[i, seq_len(N[i])]
       prob_log <- rep(NA_real_, K + m_Neal8)
       index <- match(1:K, s)
       
@@ -615,8 +654,10 @@ Gibbs_sampler <- function (
         log = TRUE
       )) - Pr_sum_log(
         beta = beta,
+        gamma = gamma,
         m_1 = m[1],
-        S = S[i],
+        delta = delta,
+        eta2,
         LS = LS_compute(Sigma_Y_div_sigma2_compute(m[2], N[i]), sigma2),
         x = x[i, ]
       ) + dnorm(
@@ -624,9 +665,6 @@ Gibbs_sampler <- function (
         mean = sum(x[i, ] * gamma) + delta,
         sd = sqrt(eta2),
         log = TRUE
-      ) - pnorm(
-        q = (sum(x[i, ] * gamma) + delta - log(T_N[i])) / sqrt(eta2),
-        log.p = TRUE
       )
       
       for (h in 1:K) {
@@ -648,6 +686,7 @@ Gibbs_sampler <- function (
         } else if (prob_log_max == Inf) prob_log == Inf
       )
       
+      
       if (s[i] > K) {
         
         m[i, ] <- m_proposal[s[i] - K, ]
@@ -665,6 +704,7 @@ Gibbs_sampler <- function (
         delta[i] <- delta[index[s[i]]]
         
       }
+      
       
       # Update LS if m[i, 2] changed.
       if (m[i, 2] != m_i_2) LS[i, ] <- LS_compute(
@@ -687,17 +727,19 @@ Gibbs_sampler <- function (
       
       # m_1
       Sigma_m_1 <- 1 / (1 / sigma2_m + sum(
-        1 + (N[index] - 1) * (1 - m[index, 2])^2
+        ifelse(N[index] == 0L, 0, 1 + (N[index] - 1) * (1 - m[index, 2])^2)
       ) / sigma2)
       
       m[index, 1] <- slice_sampling(
         x0 = m[index[1], 1],
-        g = function (m_star_1) dnorm(
+        g = function(m_star_1) dnorm(
           x = m_star_1,
           mean = Sigma_m_1 * sum(tmp[index]) / sigma2,
           sd = sqrt(Sigma_m_1),
           log = TRUE
-        ) - Pr_sum_log(beta, m_star_1, S[index], LS[index, ], x[index, ]),
+        ) - Pr_sum_log(
+          beta, gamma, m_star_1, delta[index], eta2, LS[index, ], x[index, ]
+        ),
         w = sqrt(Sigma_m_1)
       )
       
@@ -707,7 +749,7 @@ Gibbs_sampler <- function (
       Sigma_m_2_sum <- 0
       
       for (i in index) {
-        Z_i <- Z[i, 1:N[i]] - m[i, 1]
+        Z_i <- Z[i, seq_len(N[i])] - m[i, 1]
         mu_m_2_sum <- mu_m_2_sum + sum(Z_i[-1] * Z_i[-N[i]])
         Sigma_m_2_sum <- Sigma_m_2_sum + sum(Z_i[-N[i]]^2)
       }
@@ -716,15 +758,17 @@ Gibbs_sampler <- function (
       
       m[index, 2] <- slice_sampling(
         x0 = m[index[1], 2],
-        g = function (m_star_2) dnorm(
+        g = function(m_star_2) dnorm(
           x = m_star_2,
           mean = Sigma_m_2 * mu_m_2_sum / sigma2,
           sd = sqrt(Sigma_m_2),
           log = TRUE
         ) - Pr_sum_log(
           beta = beta,
+          gamma = gamma,
           m_1 = m[index, 1],
-          S = S[index],
+          delta = delta[index],
+          eta2,
           LS = LS_compute(
             Sigma_Y_div_sigma2 = Sigma_Y_div_sigma2_compute(m_star_2, N[index]),
             sigma2 = sigma2
@@ -741,15 +785,14 @@ Gibbs_sampler <- function (
       
       delta[index] <- slice_sampling(
         x0 = delta[index[1]],
-        g = function (delta_star) dnorm(
+        g = function(delta_star) dnorm(
           x = delta_star,
           mean = Sigma_delta * sum(log(S[index]) - xTgamma ) / eta2,
           sd = sqrt(Sigma_delta),
           log = TRUE
-        ) - sum(pnorm(
-          q = (xTgamma + delta_star - log(T_N[index])) / sqrt(eta2),
-          log.p = TRUE
-        )),
+        ) - Pr_sum_log(
+          beta, gamma, m[index, 1], delta_star, eta2, LS[index, ], x[index, ]
+        ),
         w = sqrt(Sigma_delta)
       )
       
@@ -783,16 +826,18 @@ Gibbs_sampler <- function (
     
     sigma2 <- 1 / slice_sampling(
       x0 = 1 / sigma2,
-      g = function (sigma2_inv) dgamma(
+      g = function(sigma2_inv) dgamma(
         x = sigma2_inv,
         shape = a_sigma2,
         rate = b_sigma2,
         log = TRUE
       ) - Pr_sum_log(
         beta = beta,
+        gamma = gamma,
         m_1 = m[, 1],
-        S = S,
-        LS = LS_compute(Sigma_Y_div_sigma2, sigma2),
+        delta = delta,
+        eta2,
+        LS = LS_compute(Sigma_Y_div_sigma2, 1 / sigma2_inv),
         x = x
       ),
       w = sqrt(a_sigma2) / b_sigma2,
@@ -807,36 +852,38 @@ Gibbs_sampler <- function (
     
     eta2 <- 1 / slice_sampling(
       x0 = 1 / eta2,
-      g = function (eta2_inv) dgamma(
+      g = function(eta2_inv) dgamma(
         x = eta2_inv,
         shape = a_eta2,
         rate = b_eta2,
         log = TRUE
-      ) - sum(pnorm(
-        q = (mu - log(T_N)) * sqrt(eta2_inv),
-        log.p = TRUE
-      )),
+      ) - Pr_sum_log(beta, gamma, m[, 1], delta, 1 / eta2_inv, LS, x),
       w = sqrt(a_eta2) / b_eta2,
       lower = 0
     )
     
-    # Update lambda.
-    a_lambda_star <- a_lambda + sum(N)
+    
+    # Update r and lambda.
+    r <- slice_sampling(
+      x0 = r,
+      g = function(r) dgamma(
+        x = r, shape = a_r, rate = b_r, log = TRUE
+      ) + sum(dnbinom(x = N, size = r, mu = lambda, log = TRUE)),
+      w = sqrt(a_r) / b_r,
+      lower = 0
+    )
     
     lambda <- slice_sampling(
       x0 = lambda,
-      g = function (lambda) dgamma(
-        x = lambda,
-        shape = a_lambda_star,
-        rate = b_lambda_star,
-        log = TRUE
-      ) - L * log1p(-exp(-lambda)),
-      w = sqrt(a_lambda_star) / b_lambda_star,
+      g = function(lambda) dgamma(
+        x = lambda, shape = a_lambda, rate = b_lambda, log = TRUE
+      ) + sum(dnbinom(x = N, size = r, mu = lambda, log = TRUE)),
+      w = sqrt(a_lambda) / b_lambda,
       lower = 0
     )
     
     
-    if (iter > burnin & (iter - burnin) %% thin == 0) {
+    if (iter > burnin & (iter - burnin) %% thin == 0L) {
       
       it <- (iter - burnin) / thin
       
@@ -856,6 +903,7 @@ Gibbs_sampler <- function (
       
       sigma2_Gibbs[it] <- sigma2
       eta2_Gibbs[it] <- eta2
+      r_Gibbs[it] <- r
       lambda_Gibbs[it] <- lambda
       
     }
@@ -880,6 +928,7 @@ Gibbs_sampler <- function (
     M = M_Gibbs,
     sigma2 = sigma2_Gibbs,
     eta2 = eta2_Gibbs,
+    r = r_Gibbs,
     lambda = lambda_Gibbs
   )
   
