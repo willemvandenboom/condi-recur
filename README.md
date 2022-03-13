@@ -3,7 +3,8 @@
 Repository with the code used for the paper "Bayesian inference on the number
 of recurrent events: A joint model of recurrence and survival" by Willem van
 den Boom, Maria De Iorio and Marta Tallarita
-([arXiv:2005.06819](https://arxiv.org/abs/2005.06819)).
+([arXiv:2005.06819](https://arxiv.org/abs/2005.06819) and
+[doi:10.1177/09622802211048059](https://doi.org/10.1177/09622802211048059)).
 
 
 ## Description of files
